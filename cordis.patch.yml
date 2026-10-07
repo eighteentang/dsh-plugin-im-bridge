@@ -23,5 +23,18 @@
       name: dsh-plugin-im-bridge
       config:
         sandbox: true
-        workspace: 'D:\EasyDSH'
         showReasoning: false
+        # ⚠ **刻意不设 `workspace`**（2026-10-07 修）
+        #
+        # 这里曾经写着 `workspace: 'D:\EasyDSH'` —— 那是开发机的路径，
+        # 而这份文件是**随包发布**的：别人 `dsh plugin add <本仓库>` 之后，
+        # 这个值会进他们的配置，把 agent 的工作目录指向一个**他们机器上不存在的路径**。
+        #
+        # 为什么当初会写上去：开发者自己的 profile 里需要它。但那是
+        # **profile 自己的 patch 层**该管的事，不该塞进产品默认值。
+        #
+        # 不设时的行为（插件里的解析顺序）：
+        #   config.workspace → $DSH_WORKSPACE → process.cwd()
+        # 所以留空 = 用 DSH 自己的工作目录，这对每个用户都是对的。
+        #
+        # 如果你确实想指定，请在你**自己 profile** 的 patch 里加这一行，不要改这里。

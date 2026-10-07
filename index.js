@@ -266,6 +266,45 @@ async function readDefaultModelOptions(ctx, config) {
 }
 
 /**
+ * 决定 QQ 会话的工作目录。
+ *
+ * 解析顺序：`config.workspace` → `$DSH_WORKSPACE` → `process.cwd()`
+ *
+ * ⚠ **为什么要多加一层"目录存在才用它"**（2026-10-07 修的真问题）：
+ *
+ * 这份插件的 `cordis.patch.yml` 是**随包发布**的，而它曾经写着
+ * `workspace: 'D:\EasyDSH'` —— **开发机的路径**。别人从 GitHub 装完，
+ * 这个值会进他们的配置，把工作目录指向一个在他们机器上不存在的路径。
+ *
+ * 光删掉那个默认值还不够，还要挡住另外两种情况：
+ *   · 用户改过 workspace，后来把那个目录删了或改名了
+ *   · 多台机器共用一份配置（同步 dotfiles），路径只在一台上存在
+ *
+ * 两种情况原来的表现都是**静默**的：agent 在一个不存在的目录里干活，
+ * 读文件报"找不到"、glob 结果为空 —— 而看配置一切正常，极难排查。
+ *
+ * 所以：**候选路径不存在就跳过它**，并记一条日志说清楚去了哪。
+ */
+function resolveWorkspace(config) {
+  const candidates = [
+    ['config.workspace', firstNonEmpty([config.workspace])],
+    ['$DSH_WORKSPACE', firstNonEmpty([process.env.DSH_WORKSPACE])],
+  ];
+  for (const [source, value] of candidates) {
+    if (value === undefined) continue;
+    if (existsSync(value)) return value;
+    // 明确记下"配置了但不存在"—— 这正是原来静默的地方
+    recordStatus('workspace-missing-fallback', {
+      source,
+      configured: value,
+      fallback: process.cwd(),
+      note: '配置里的工作目录不存在 → 回退到进程 cwd',
+    });
+  }
+  return process.cwd();
+}
+
+/**
  * 插件名（Cordis 用它标识这个插件，日志前缀也用它）。
  *
  * 2026-10-07 从 'qq-bridge' 改成 'im-bridge'，和 cordis.patch.yml 里的行 id 对齐。
@@ -1293,7 +1332,23 @@ export function apply(ctx, config = {}) {
 
     // ③ 全新创建。用 parentAgent 拿到被驱动的生命周期。
     const owner = ctx.agents.roots()[0];
-    const workspace = firstNonEmpty([config.workspace, process.env.DSH_WORKSPACE]) ?? process.cwd();
+    // 工作目录：config → $DSH_WORKSPACE → process.cwd()。
+    //
+    // ⚠ **为什么要有 existsSync 这一层**（2026-10-07 修的真问题）：
+    //
+    // 这份插件的 `cordis.patch.yml` 是**随包发布**的，而它曾经写着
+    // `workspace: 'D:\EasyDSH'` —— **开发机的路径**。别人从 GitHub 装完，
+    // 这个值会进他们的配置，把工作目录指向一个**他们机器上不存在的路径**。
+    //
+    // 光删掉那个默认值不够，还要挡住另外两种情况：
+    //   · 用户改过 workspace，后来把那个目录删了或改名了
+    //   · 多台机器共用一份配置（同步 dotfiles），路径只在一台上存在
+    //
+    // 两种情况原来的表现都是**静默**的：agent 在一个不存在的目录里干活，
+    // 读文件报"找不到"、glob 结果为空 —— 而看配置一切正常，极难排查。
+    //
+    // 所以：**路径不存在就不用它**，退到下一个候选，并记一条日志说清楚。
+    const workspace = resolveWorkspace(config);
 
     // ⚠ 必须显式给模型：`CreateAgentOptions.agentOptions = { provider, model, reasoningEffort }`。
     //
