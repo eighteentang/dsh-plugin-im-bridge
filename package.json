@@ -1,0 +1,36 @@
+{
+  "name": "dsh-plugin-im-bridge",
+  "version": "1.0.0",
+  "description": "把 QQ 作为 DSH 的对话入口：客户端内一键连接、消息双向互通、随客户端启停。",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "files": [
+    "index.js",
+    "client.js",
+    "control-server.js",
+    "busy-tracker.js",
+    "cordis.patch.yml"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": false,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "meta": {
+    "title": "IM 桥接",
+    "description": "把 QQ 机器人接进 DSH：手机上发消息，电脑上的 agent 干活。"
+  }
+}

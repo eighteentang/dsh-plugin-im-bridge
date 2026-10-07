@@ -1,0 +1,19 @@
+# 临时文件与备份
+*.bak
+*.bak-*
+*.backup
+_tmp-*
+*.tmp
+
+# 日志
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 依赖（这个插件没有外部依赖，但防止误提交）
+node_modules/
+pnpm-lock.yaml

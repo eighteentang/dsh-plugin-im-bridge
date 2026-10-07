@@ -1,0 +1,27 @@
+# IM 桥接插件 · 组合包补丁
+#
+# 命名说明（2026-09-26 从 "QQ 桥接 / qq-plugin-fresh / ...-v4" 改成现在的名字）：
+#   这个插件的**内核与平台无关**（队列、会话、面板、preset、权限），
+#   只有传输层是平台专属的（QQ 的 WebSocket 网关 + C2C 消息）。
+#   所以包名用 `im-bridge`（IM = 即时通讯），以后加飞书就是新增一个传输层。
+#
+#   而**平台专属的东西保持 QQ 命名**，这是有意的、不是漏改：
+#     · 凭据记录键 `im-bridge/bot` 里存的仍是 QQ_BOT_APPID / QQ_BOT_SECRET
+#     · 面板标题「奇怪的企鹅」、qqb-* CSS 类名 —— 那是"QQ 这个机器人"的身份
+#     · 会话里 `QQ_BOT_*` 这些环境变量名是平台契约，不能通用化
+#
+# ⚠ 为什么**不要随便改这个包名**（血的教训）：
+#   Node 的 ESM 缓存以**文件 URL** 为键 —— 同一进程内同一路径永远返回同一模块实例；
+#   Cordis 的 runtime 又按 callback 身份缓存 { ..., Config: plugin.Config }。
+#   两者叠加 => 改完插件代码后只要 DSH 不重启，「禁用再启用」用的还是旧模块。
+#   历史上靠"换全新目录 + 全新包名"来绕开它（所以名字里曾带 -v2 / -v3 / -v4）。
+#   每换一次名的代价是：要卸载重装 + **丢掉整个会话历史**（会话 id 跟着前缀走）。
+#   正常改代码只需要**重启客户端**，不需要换名。
+
+- insert:
+    - id: im-bridge
+      name: dsh-plugin-im-bridge
+      config:
+        sandbox: true
+        workspace: 'D:\EasyDSH'
+        showReasoning: false
