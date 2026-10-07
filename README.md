@@ -115,6 +115,46 @@ dsh plugin --profile web add github:你的用户名/dsh-plugin-im-bridge
 1. 插件装到了**正确的 profile**（`dsh plugin --profile <名字> list` 能看）
 2. 客户端**真的重启了** —— 只禁用再启用不够，Node 的模块缓存会让它继续用旧代码
 
+### 钉住版本（推荐）
+
+上面的命令装的是 `main` 的**最新提交** —— 上游随时可能变。
+想要一个**不会自己变**的版本，就用标签：
+
+```sh
+# 装某个具体版本
+dsh plugin --profile web add github:eighteentang/dsh-plugin-im-bridge#v1.1.0
+
+# 看有哪些版本可选
+#   https://github.com/eighteentang/dsh-plugin-im-bridge/tags
+```
+
+**每个版本改了什么**：见 [CHANGELOG.md](./CHANGELOG.md)。
+
+### 升级
+
+```sh
+dsh plugin --profile web add github:eighteentang/dsh-plugin-im-bridge#v1.2.0   # 换成的版本号
+```
+
+然后**重启客户端**。
+
+> **升级不会丢凭据。** 插件在启动时会自动把旧键名的凭据迁移到新键名
+> （`credential-migrated` 那条日志就是它干的）。
+>
+> **但升级可能会丢会话历史** —— 如果新版本换了内部会话 id 前缀。
+> 那种情况 `CHANGELOG.md` 里会写明。会话历史丢了不影响功能，
+> 只是 QQ 那条线的上下文从头开始。
+
+### 我装的是哪个版本？
+
+看 profile 里那份 `package.json` 的 `dsh-plugin-im-bridge` 字段：
+
+```sh
+# 装了标签版 → 显示 github:eighteentang/dsh-plugin-im-bridge#v1.1.0
+# 装了浮动版 → 显示 github:eighteentang/dsh-plugin-im-bridge
+cat ~/.dsh/profiles/<profile名>/package.json
+```
+
 ---
 
 ## 四、填凭据并连接
@@ -284,9 +324,12 @@ dsh plugin --profile web remove dsh-plugin-im-bridge
 
 ---
 
-## 十一、许可
+## 十一、许可与版本
 
 MIT —— 见 [LICENSE](./LICENSE)。
+
+**当前版本**：见 [CHANGELOG.md](./CHANGELOG.md) 最上面那条。
+**钉版本 / 升级**：见上面的「钉住版本（推荐）」一节。
 
 **这个插件不是 DeepSeek 官方项目**，是第三方插件。
 QQ 相关的接口用法来自腾讯的公开文档。

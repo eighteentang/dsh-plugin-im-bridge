@@ -1,16 +1,35 @@
 {
   "name": "dsh-plugin-im-bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "把 QQ 作为 DSH 的对话入口：客户端内一键连接、消息双向互通、随客户端启停。",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "qq",
+    "qqbot",
+    "im",
+    "bridge"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eighteentang/dsh-plugin-im-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/eighteentang/dsh-plugin-im-bridge/issues"
+  },
   "files": [
     "index.js",
     "client.js",
     "control-server.js",
     "busy-tracker.js",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "exports": {
     ".": "./index.js",
