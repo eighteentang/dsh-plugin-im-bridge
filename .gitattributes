@@ -1,0 +1,15 @@
+# 统一换行符为 LF —— 否则 Windows 上编辑会把整个文件标记成"全改了"。
+# 这个插件是在 Windows 上开发的，但仓库要给别人 clone，换行符必须一致。
+* text=auto eol=lf
+
+# 明确按文本处理的
+*.js   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+
+# 明确当二进制处理的（防止 git 试图"转换"它们）
+*.png  binary
+*.ico  binary
+*.jpg  binary
