@@ -561,6 +561,28 @@ const ConfigSchema = {
           // 是否把思考过程也发到 QQ
           showReasoning: input.showReasoning === true,
           /**
+           * 微信通道：收到消息时**立刻**回一条短确认（诊断用，默认**关**）。
+           *
+           * ── 为什么需要它（2026-10-08 的一次真故障）─────────────────────
+           * 实测现象：agent 真的答了 624 字，iLink 返回 **HTTP 200**，
+           * 请求体与"旧代码能送达"那版**逐字相同** —— 但用户什么都没收到。
+           *
+           * 剩下最可能的分歧是**时延**：
+           *   · 旧代码（送达成功）：收到 → 立刻发（~0.4 秒）
+           *   · 新代码（没送达）  ：收到 → agent 干活 → 发（10.8 秒 / 1.2 秒）
+           * iLink 的 `context_token` 有可能只在短时间内有效。
+           *
+           * 打开它之后，同一个会话里应该先收到一条**短确认**、稍后才收到正式回答：
+           *   ✓ 确认到了、正式回答没到 → 是**时延/令牌有效期**问题
+           *   ✗ 两个都没到             → 是**发送通道本身**的问题（与 agent 无关）
+           *   ✓ 两个都到了             → 通道没问题，是别的原因（且此时正式回答也送达了）
+           *
+           * 一句话就能分辨，不用再猜。诊断完请关掉 —— 否则用户会多收到一条消息。
+           */
+          weixinInstantAck: input.weixinInstantAck === true,
+          /** 上面那条确认的文本。留空用默认。 */
+          weixinAckText: typeof input.weixinAckText === 'string' ? input.weixinAckText : '',
+          /**
            * QQ 会话的**权限预设** —— 决定它能干什么（2026-09-26 加）。
            *
            * 为什么要显式设：默认预设是 `workspace-write`，它的语义是
@@ -915,6 +937,18 @@ export function apply(ctx, config = {}) {
       token,
       onInbound: (text, reply) => {
         recordStatus('weixin-inbound-text', { text: text.slice(0, 80) });
+
+        // 诊断开关：立刻回一条短确认，用来分辨"时延问题"还是"通道问题"。
+        // 见 Config 里 weixinInstantAck 的说明。**不要 await** —— 它必须在
+        // 收到消息的当下一瞬间发出去，等它就失去诊断意义了。
+        if (config.weixinInstantAck === true) {
+          const ack = firstNonEmpty([config.weixinAckText, '（收到，正在处理…）']);
+          void Promise.resolve(reply(ack)).then(
+            () => recordStatus('weixin-instant-ack-sent', { bytes: ack.length }),
+            (error) => recordStatus('weixin-instant-ack-failed', { message: describeError(error) }),
+          );
+        }
+
         // peer 用不了 openid（微信是 from_user_id），从闭包里拿不到，
         // 所以队列键用会话 id —— 微信是单聊场景，不需要再按人分。
         //

@@ -309,6 +309,17 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
    * 返回 boolean 让调用方能据此决定要不要重试；失败时把**返回体**记进事件里，
    * 这样"发失败了"能看到服务端到底说了什么（而不是只知道"抛了异常"）。
    */
+  /**
+   * 回一条文本。必须原样带上 `message.context_token`，否则关联不到会话。
+   *
+   * 返回 boolean 让调用方能据此决定要不要重试。
+   *
+   * ⚠ **成功路径也要把返回体记进日志**（2026-10-08 补）：
+   *   原来只有失败时记 `body`，成功时只记 `bytes`。
+   *   结果遇到"HTTP 200、日志报成功、用户什么都没收到"时**完全无从下手** ——
+   *   因为唯一能证明服务端是否真的接受了那条消息的，就是**返回体**。
+   *   接受成功通常会带一个 message id，那正是能和用户侧对上的东西。
+   */
   const sendTo = async (message, text) => {
     const body = {
       msg: {
@@ -322,16 +333,25 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
     try {
       const r = await post('ilink/bot/sendmessage', body);
       const failure = bodyLooksFailed(r);
+      // 成功/失败的返回体都记（截断）—— "报成功但没收到"这类问题只能靠它查
+      const raw = String(r.raw ?? '').slice(0, 300);
       if (failure !== null) {
         onEvent?.('weixin-reply-failed', {
           reason: failure,
           bytes: text.length,
-          // 记返回体（截断）—— "报成功但没收到"这类问题只能靠它查
-          body: String(r.raw ?? '').slice(0, 300),
+          body: raw,
         });
         return false;
       }
-      onEvent?.('weixin-replied', { bytes: text.length, status: r.status });
+      onEvent?.('weixin-replied', {
+        bytes: text.length,
+        status: r.status,
+        // 记请求的关键字段 —— 排查"服务端收了但没送到"时要看它们
+        toUserId: String(message.from_user_id ?? '').slice(0, 24),
+        hasContextToken: typeof message.context_token === 'string' && message.context_token !== '',
+        contextTokenLen: String(message.context_token ?? '').length,
+        body: raw,
+      });
       return true;
     } catch (error) {
       onEvent?.('weixin-reply-failed', { message: describeError(error) });
