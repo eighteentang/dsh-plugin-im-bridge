@@ -131,9 +131,12 @@ dsh plugin --profile web add <本仓库地址>
 dsh plugin --profile web add github:你的用户名/dsh-plugin-im-bridge
 ```
 
-> **`--profile` 的名字**：桌面客户端用的是 `web` 或 `desktop`，
-> 取决于你装的是哪个版本。不确定就看你 profile 目录：
-> `~/.dsh/profiles/` 下的那个名字。
+> **`--profile` 的名字**：填**你自己的** profile 名 —— 看 `~/.dsh/profiles/`
+> 下的目录名就是它。
+>
+> ⚠ 上面示例里的 `web` 是 **DSH 随附的模板名**，不必然是你的 profile 名。
+> 用 `dsh --profile <名字> --from-default-profile <模板>` 新建过的 profile
+> 会是别的名字（例如 `desktop`）。**写错名字 = 装到另一个 profile，当前客户端看不到。**
 
 装完后**重启 DSH 客户端**。
 
