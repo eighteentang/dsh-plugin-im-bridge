@@ -119,16 +119,10 @@ AppSecret   —— 一串字母数字，**不要外传**
 
 ### 方式：命令行安装
 
-DSH 自带插件管理命令。**把 `<本仓库地址>` 换成实际的仓库地址**：
+DSH 自带插件管理命令：
 
 ```sh
-dsh plugin --profile web add <本仓库地址>
-```
-
-例如（发布后）：
-
-```sh
-dsh plugin --profile web add github:你的用户名/dsh-plugin-im-bridge
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.3
 ```
 
 > **`--profile` 的名字**：填**你自己的** profile 名 —— 看 `~/.dsh/profiles/`
@@ -161,7 +155,7 @@ dsh plugin --profile web add github:你的用户名/dsh-plugin-im-bridge
 
 ```sh
 # 装某个具体版本
-dsh plugin --profile web add github:eighteentang/dsh-plugin-im-bridge#v1.2.2
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.3
 
 # 看有哪些版本可选
 #   https://github.com/eighteentang/dsh-plugin-im-bridge/tags
@@ -177,7 +171,7 @@ dsh plugin --profile web add github:eighteentang/dsh-plugin-im-bridge#v1.2.2
 ### 升级
 
 ```sh
-dsh plugin --profile web add github:eighteentang/dsh-plugin-im-bridge#v1.2.2   # 换成的版本号
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.3   # 换成的版本号
 ```
 
 然后**重启客户端**。
@@ -194,7 +188,7 @@ dsh plugin --profile web add github:eighteentang/dsh-plugin-im-bridge#v1.2.2   #
 看 profile 里那份 `package.json` 的 `dsh-plugin-im-bridge` 字段：
 
 ```sh
-# 装了标签版 → 显示 github:eighteentang/dsh-plugin-im-bridge#v1.2.2
+# 装了标签版 → 显示 github:eighteentang/dsh-plugin-im-bridge#v1.2.3
 # 装了浮动版 → 显示 github:eighteentang/dsh-plugin-im-bridge
 cat ~/.dsh/profiles/<profile名>/package.json
 ```
@@ -350,7 +344,7 @@ im-bridge → 回手机（各平台各自的回复通道）
 ## 九、卸载
 
 ```sh
-dsh plugin --profile web remove dsh-plugin-im-bridge
+dsh plugin --profile <你的profile名> remove dsh-plugin-im-bridge
 ```
 
 > **已知问题**：卸载后 `~/.dsh/profiles/<名字>/node_modules/` 下可能残留一个

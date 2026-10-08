@@ -8,8 +8,31 @@
 **怎么钉版本**（避免"装到一半上游改了"）：
 
 ```sh
-dsh plugin --profile web add github:eighteentang/dsh-plugin-im-bridge#v1.2.2
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.3
 ```
+
+---
+
+## [1.2.3] - 2026-10-08
+
+**文档与元数据版本** —— 没有改任何代码行为。
+
+### 文档
+
+- **README 补上多平台**：原来整篇只讲 QQ（标题写"把 QQ 机器人接成 DSH 的对话入口"、
+  第二章写"你需要一个 QQ 机器人"），而微信不用申请任何东西、扫码即可。
+  现在新增「零、现在支持哪些平台」能力表（每个平台能做什么、怎么连），
+  第二章拆成两条路（微信 / QQ），"试第一条消息"按平台分开给排查表。
+- **`--profile` 的说法改准确**：`web` 是 DSH **随附的模板名**，不必然是用户的 profile 名。
+  照抄 `web` 会装到另一个 profile、当前客户端看不到（很难自查）。
+  详见 [dsh-app-boot 的说明](https://github.com/deepseek-ai)。
+
+### 元数据
+
+- `description`：补上"各平台完成度不同"这个事实 —— 原文只写"把 QQ / 微信等 IM 接成…"，
+  容易被读成"所有提到的平台都能用"。实际只有 QQ 与微信能收发并接 agent。
+- `keywords`：补 `wechat`（微信已是完整可用平台，但 keywords 是只有 QQ 时写的）；
+  去掉过宽的 `bridge`，换成更精确的 `im-bridge`。
 
 ---
 
