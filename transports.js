@@ -258,21 +258,56 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
   /** 最近一条入站消息 —— 只为 sendTo 这个逃生口保留 */
   let lastMessage = null;
 
+  /**
+   * 发一条 POST 并把返回体交回调用方。
+   *
+   * ⚠ 为什么要把返回体**往上带**（2026-10-08 修的真问题）：
+   *   原来这里只 `return await response.json()`，而调用方**完全不看**它 ——
+   *   于是"HTTP 200 但体内带错误码"会被当成成功。
+   *   实测症状：日志报 `weixin-replied bytes=2`（成功），而用户**什么都没收到**。
+   *   这和当初 QQ 那个 `msg_id` 的坑**同型**：把"请求发出去了"当成"对方收到了"。
+   *   微信/iLink 这类接口的惯例是 HTTP 200 + 体内 errcode/ret 字段，
+   *   所以必须以**返回体**为准。
+   */
   const post = async (path, body) => {
     const response = await fetchWithTimeout(
       `${ILINK_BASE}/${path}`,
       { method: 'POST', headers: ilinkHeaders(token), body: JSON.stringify(body) },
       45_000,
     );
-    return await response.json();
+    const text = await response.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = undefined; }
+    return { status: response.status, ok: response.ok, body: json, raw: text };
+  };
+
+  /**
+   * 判断一个返回体算不算"成功"。
+   *
+   * 判据要**宽松而明确**：只在能确定失败时判失败，其它情况判成功。
+   * 因为不确定时判失败会导致误报（把成功的当失败，触发无谓重试）；
+   * 而"能确定失败"的信号是明确的：HTTP 非 2xx，或体内出现非 0 的错误码字段。
+   *
+   * 支持的错误码字段：`errcode` / `ret` / `code` / `errCode`（跨腾讯系接口的常见命名）。
+   * 值为 0 或缺失 → 视为成功。
+   */
+  const bodyLooksFailed = (r) => {
+    if (r.ok !== true) return `http-${r.status}`;
+    const b = r.body;
+    if (b === undefined || b === null || typeof b !== 'object') return null;
+    for (const field of ['errcode', 'ret', 'code', 'errCode']) {
+      const v = b[field];
+      if (typeof v === 'number' && v !== 0) return `${field}=${v}`;
+      if (typeof v === 'string' && v !== '' && v !== '0') return `${field}=${v}`;
+    }
+    return null;
   };
 
   /**
    * 回一条文本。必须原样带上 `message.context_token`，否则关联不到会话。
    *
-   * ⚠ 失败**不上抛**，只记事件 —— 但会把成功/失败都报给 onEvent，
-   *   这样上层能区分"发出去了"和"发失败了"（原来两者都只是静默）。
-   *   返回 boolean 让调用方能据此决定要不要重试。
+   * 返回 boolean 让调用方能据此决定要不要重试；失败时把**返回体**记进事件里，
+   * 这样"发失败了"能看到服务端到底说了什么（而不是只知道"抛了异常"）。
    */
   const sendTo = async (message, text) => {
     const body = {
@@ -285,8 +320,18 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
       },
     };
     try {
-      await post('ilink/bot/sendmessage', body);
-      onEvent?.('weixin-replied', { bytes: text.length });
+      const r = await post('ilink/bot/sendmessage', body);
+      const failure = bodyLooksFailed(r);
+      if (failure !== null) {
+        onEvent?.('weixin-reply-failed', {
+          reason: failure,
+          bytes: text.length,
+          // 记返回体（截断）—— "报成功但没收到"这类问题只能靠它查
+          body: String(r.raw ?? '').slice(0, 300),
+        });
+        return false;
+      }
+      onEvent?.('weixin-replied', { bytes: text.length, status: r.status });
       return true;
     } catch (error) {
       onEvent?.('weixin-reply-failed', { message: describeError(error) });
@@ -297,10 +342,17 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
   const loop = async () => {
     while (!stopped) {
       try {
-        const data = await post('ilink/bot/getupdates', {
+        const upd = await post('ilink/bot/getupdates', {
           get_updates_buf: cursor,
           base_info: { channel_version: '2.4.9' },
         });
+        // ⚠ `post` 返回的是包装对象（{status, ok, body, raw}）—— 要取 `.body`。
+        //   轮询失败也要记下来：原来只在抛异常时才记，而"200 + 体内错误码"会被漏掉。
+        const updFailure = bodyLooksFailed(upd);
+        if (updFailure !== null) {
+          throw new Error(`getupdates 返回失败：${updFailure} ${String(upd.raw ?? '').slice(0, 160)}`);
+        }
+        const data = upd.body;
         failures = 0;
         if (typeof data?.get_updates_buf === 'string' && data.get_updates_buf !== '') {
           cursor = data.get_updates_buf;   // 游标必须更新，否则会重复收到消息

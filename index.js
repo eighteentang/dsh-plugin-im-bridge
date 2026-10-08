@@ -915,9 +915,18 @@ export function apply(ctx, config = {}) {
       token,
       onInbound: (text, reply) => {
         recordStatus('weixin-inbound-text', { text: text.slice(0, 80) });
-        // peer 用不了 openid（微信是 from_user_id），这里从闭包里拿不到，
+        // peer 用不了 openid（微信是 from_user_id），从闭包里拿不到，
         // 所以队列键用会话 id —— 微信是单聊场景，不需要再按人分。
-        enqueueDelivery(weixinSessionId, text, '', undefined, { platform: 'weixin', reply });
+        //
+        // ⚠ `reply` 返回的是 Promise，`finishTurn` 会拿它 `.then()` ——
+        //   所以这里必须**把 Promise 原样 return 出去**，让它真的等到 API 结果。
+        //   写 `reply: reply` 也行（它本身就是返回 Promise 的函数），
+        //   但包一层 `Promise.resolve(...)` 能把"不是 Promise"的意外情况也吃掉，
+        //   避免 `finishTurn` 里 `.then()` 抛 "不是一个函数"。
+        enqueueDelivery(weixinSessionId, text, '', undefined, {
+          platform: 'weixin',
+          reply: (replyText) => Promise.resolve(reply(replyText)),
+        });
       },
       onEvent: (event, detail) => {
         recordStatus(event, detail ?? {});
