@@ -310,6 +310,34 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
    * 这样"发失败了"能看到服务端到底说了什么（而不是只知道"抛了异常"）。
    */
   /**
+   * 生成 `client_id` —— **每条出站消息都必须不同**。
+   *
+   * ── 这是"日志报成功、用户收不到"的**真正根因**（2026-10-08 查明）──────
+   *
+   * 官方协议规范里有一条实验结论（原文）：
+   *
+   *   "使用**同一个 client_id** 发送 GENERATING → GENERATING → FINISH 三条消息，
+   *    API 层面**均返回 200**，但微信客户端**仅显示第一条**的内容，
+   *    后续的 GENERATING 和 FINISH 更新未在聊天气泡中渲染。
+   *    对照组使用**不同 client_id** 各发一条 FINISH，三条消息均独立显示。"
+   *
+   * 而我们原来**根本没传 client_id**（一直是 undefined）——
+   * 于是服务端/客户端把每条新回复都当成"同一条消息的更新"：
+   * **第一条渲染出来，之后的全都不显示**，而 API 每次都回 200。
+   *
+   * 症状就是用户遇到的："第一次（测试回显）收到了，之后全部收不到"。
+   * 这个字段在官方 SDK 里是 `generateId('openclaw-weixin')` 的产物，
+   * 也是它 `sendMessageWeixin()` 返回的那个 `messageId`。
+   *
+   * 格式没有服务端约束，只要求全局唯一。用"前缀 + 时间戳 + 随机"，
+   * 既唯一又能从日志里看出是哪条。
+   */
+  function generateClientId() {
+    const rand = Math.random().toString(36).slice(2, 10);
+    return `im-bridge:${Date.now()}-${rand}`;
+  }
+
+  /**
    * 回一条文本。必须原样带上 `message.context_token`，否则关联不到会话。
    *
    * 返回 boolean 让调用方能据此决定要不要重试。
@@ -318,17 +346,24 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
    *   原来只有失败时记 `body`，成功时只记 `bytes`。
    *   结果遇到"HTTP 200、日志报成功、用户什么都没收到"时**完全无从下手** ——
    *   因为唯一能证明服务端是否真的接受了那条消息的，就是**返回体**。
-   *   接受成功通常会带一个 message id，那正是能和用户侧对上的东西。
    */
   const sendTo = async (message, text) => {
+    // ⚠ 每次调用都生成新的 —— 复用会导致客户端把新消息当成旧消息的更新而**不显示**
+    const clientId = generateClientId();
     const body = {
       msg: {
+        // 官方实现固定填空串（表示由 bot 侧发出）
+        from_user_id: '',
         to_user_id: message.from_user_id,
-        message_type: 2,
-        message_state: 2,
+        // ★ 关键修复：没有它，后续消息会在客户端侧被当作重复更新而不渲染
+        client_id: clientId,
+        message_type: 2,     // MessageType.BOT
+        message_state: 2,    // MessageState.FINISH
         context_token: message.context_token,
         item_list: [{ type: 1, text_item: { text } }],
       },
+      // 规范 §3.2：**所有**业务 POST body 都要带 base_info（原来只有 getupdates 带了）
+      base_info: { channel_version: '2.4.9' },
     };
     try {
       const r = await post('ilink/bot/sendmessage', body);
@@ -346,6 +381,9 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
       onEvent?.('weixin-replied', {
         bytes: text.length,
         status: r.status,
+        // ⚠ 记 clientId：这是"每条消息各不相同"的直接证据。
+        //   如果日志里两次的 clientId 相同 → 又被当成重复更新、用户不会看到。
+        clientId,
         // 记请求的关键字段 —— 排查"服务端收了但没送到"时要看它们
         toUserId: String(message.from_user_id ?? '').slice(0, 24),
         hasContextToken: typeof message.context_token === 'string' && message.context_token !== '',
@@ -353,11 +391,11 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
         /**
          * 从**收到用户消息**到**发出这条回复**的毫秒数。
          *
-         * ⚠ 这个数字是排查"服务端受理了但用户没收到"的关键变量：
-         *   唯一已知的成功案例是"收到后立刻发"（~0.4 秒），
-         *   而失败的那些都是等 agent 干完活（1~11 秒）才发。
-         *   如果 iLink 的 context_token 只在短时间内有效，时延就会是根因。
-         *   用户报"收到/没收到"时，拿这个数字一对就能判断。
+         * ⚠ 这个假设（"时延太长导致 context_token 失效"）**已被实测排除**：
+         *   1.53 秒发出去的也没送达，而 0.4 秒那次是第一次发送。
+         *   真因是 `client_id` 缺失（见 generateClientId 的说明）——
+         *   客户端把后续消息当成同一条的更新，所以只有第一条渲染。
+         *   这个字段保留着，作为将来排查时延类问题的现成数据。
          */
         sinceInboundMs: typeof message.__receivedAt === 'number' ? Date.now() - message.__receivedAt : null,
         body: raw,
