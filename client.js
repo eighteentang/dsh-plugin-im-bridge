@@ -478,6 +478,24 @@ window.__ModuleLoader__.load({
         }
       }, []);
 
+      /**
+       * ⚠ 这里**必须主动查一次**，不能等用户点开某一行才查（2026-10-08 修）。
+       *
+       * 我第一版写的是"点开展开按钮时才 probe"，结果：
+       *   折叠状态下 `creds[id]` 永远是 undefined → 标记渲染成空字符串 →
+       *   **用户什么都看不到**。而 QQ 那行用户根本不用点开（它已经连上了），
+       *   于是"折叠时就看得见凭据状态"这个设计目标完全没达成。
+       *
+       * 现在：加载时把所有**需要静态凭据**的平台一次性查掉。
+       * 只有 4 个（qq/feishu/dingtalk/wecom），本机回环、一次几个请求，
+       * 远比"让用户点开才知道"划算。
+       */
+      React.useEffect(() => {
+        for (const meta of PLATFORMS) {
+          if ((PLATFORM_FIELDS[meta.id] ?? []).length > 0) void probeCred(meta.id);
+        }
+      }, [probeCred]);
+
       const load = React.useCallback(async () => {
         try {
           const r = await fetch(`${CONTROL_BASE}/platforms`);
@@ -633,17 +651,17 @@ window.__ModuleLoader__.load({
             },
           }, meta.maturity === 'full' ? '可用' : '部分'),
           /**
-           * 「凭据」标记 —— 折叠状态下就能看出"填过没有"。
+           * 「凭据」标记 —— 折叠状态下就能看出"填过没有、是哪一份"。
            *
            * ⚠ 为什么要有它（2026-10-08）：原来凭据状态（"凭据已保存"）是
            *   一个**独立的区块**，跟平台开关平级 —— 于是同一个 QQ 被拆到页面两处。
-           *   现在合进这一行：折叠时看标记，展开时看字段，
-           *   其它平台本来就是这个形态，QQ 跟上即可。
+           *   现在合进这一行：折叠时看标记，展开时看字段。
            *
            * 三态都用不同说法，不能混：
-           *   undefined（还没查）→ 不显示，避免闪一下"未填"
-           *   configured:false    → 「未填凭据」（这才是要人动手的）
-           *   configured:true     → 「凭据已存」（不用再动，除非要换）
+           *   undefined（还没查）→ 显示"…"（**不显示空串** ——
+           *                        空串等于什么都没有，用户会以为这功能不存在）
+           *   configured:false    → 「· 未填凭据」（这才是要人动手的）
+           *   configured:true     → 「· 凭据尾号 XXXX」（能一眼认出是哪一份）
            */
           !needsCred ? null : h('span', {
             style: {
@@ -653,7 +671,11 @@ window.__ModuleLoader__.load({
                 ? 'var(--dsw-alias-state-success-primary)'
                 : 'var(--dsw-alias-label-secondary)',
             },
-          }, cred === undefined ? '' : (cred.configured === true ? '· 凭据已存' : '· 未填凭据')),
+          }, cred === undefined
+            ? '· 查凭据…'
+            : (cred.configured === true
+              ? `· 凭据尾号 ${cred.appIdTail ?? '????'}`
+              : '· 未填凭据')),
         // ⚠ 开关关着的平台不该显示"未连接" —— 那读起来像出错，
         //   而它其实是"你主动关的，没有任何问题"。所以先看开关。
         h('span', {
@@ -944,15 +966,16 @@ window.__ModuleLoader__.load({
         h(PlatformToggles, null),
         // ③ 可选组件 —— 重 SDK 的安装 / 卸载（体积写在按钮旁，装了能回收空间）
         h(ComponentSection, null),
-        // ④ 脚注：连接前的两件准备 + 凭据存放说明
-        h('div', { className: 'qqb-note' },
-          '连接前请先在两处做好准备：',
-          h('br'),
-          '① 在 q.qq.com 控制台的「沙箱配置」里，把你的 QQ 号加入「消息列表单聊」——不加的话机器人收不到任何消息，而且不报错；',
-          h('br'),
-          '② 家用宽带没有固定公网 IP，正式环境的 IP 白名单过不去，所以连接默认走沙箱环境。'),
+        // ④ 脚注：**只放对所有平台都成立的话**。
+        //
+        //    ⚠ 原来这里挂的是 QQ 专属的两条说明（q.qq.com 沙箱要把 QQ 号加进
+        //    「消息列表单聊」、以及家用宽带过不了 IP 白名单所以走沙箱）——
+        //    它躺在**整页最底部**，跟着"连接 IM"这个多平台页面，
+        //    于是一打开页面最显眼的长文案是企鹅的事，别的平台用户看着莫名其妙。
+        //    那两条现在归到 QQ 那一行的开通指引里（`PLATFORM_GUIDE.qq.note`），
+        //    只有真要连 QQ 的人才在那行展开时看到。
         h('div', { className: 'qqb-hint' },
-          '说明：凭据保存在本机；与各平台的通信由 Host 侧插件负责（浏览器直连会被 CORS 拦）。'));
+          '凭据保存在本机，界面不回显密钥；与各平台的通信由 Host 侧插件负责（浏览器直连会被 CORS 拦）。'));
     }
 
     /**
