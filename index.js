@@ -39,6 +39,13 @@ import {
   startWecomLoop,
   describeError,
 } from './transports.js';
+import {
+  applyPendingRemovals,
+  DEPS_DIR,
+  installComponent,
+  listComponents,
+  removeComponent,
+} from './components.js';
 
 /**
  * 状态文件 —— 让插件的行为可被外部观测。
@@ -1054,6 +1061,79 @@ export function apply(ctx, config = {}) {
       return { ok: false, message, phase: 'error' };
     }
     return { ok: true, pending: true, status: String(data?.status ?? 'wait'), message: '等扫码…', phase: 'need-scan' };
+  }
+
+  // ---- 可选组件（重 SDK）的安装 / 卸载 —— 见 components.js
+  //
+  // 为什么要有它：飞书/钉钉的长连接只能用官方 SDK（一个 35KB、一个 30MB），
+  // 不能让所有用户被迫下载。所以做成"要这个能力就自己装"。
+  //
+  // ⚠ 启动时第一件事就是清理上次没删掉的组件 —— 必须赶在任何组件的
+  //   动态 import 之前，否则文件被加载进内存就删不掉了（Windows 文件锁）。
+  {
+    const cleaned = applyPendingRemovals((line) => log(`[components] ${line}`));
+    if (cleaned.length > 0) recordStatus('components-cleaned', { ids: cleaned });
+  }
+
+  /** pnpm 的输出缓冲 —— 界面要**流式**看到，否则"点了没反应"。 */
+  const componentLog = [];
+  const COMPONENT_LOG_MAX = 400;
+  let componentBusy = '';
+
+  function pushComponentLog(chunk) {
+    for (const line of String(chunk ?? '').split(/\r?\n/)) {
+      if (line.trim() === '') continue;
+      componentLog.push(line.slice(0, 300));
+    }
+    while (componentLog.length > COMPONENT_LOG_MAX) componentLog.shift();
+  }
+
+  function getComponentsInfo() {
+    return {
+      ok: true,
+      busy: componentBusy,
+      components: listComponents(),
+      log: [...componentLog],
+      depsDir: DEPS_DIR,
+    };
+  }
+
+  async function installComponentById(id) {
+    if (componentBusy !== '') {
+      return { ok: false, message: `正在忙（${componentBusy}），等它结束再试` };
+    }
+    componentBusy = id;
+    componentLog.length = 0;
+    pushComponentLog(`开始安装 ${String(id)} …`);
+    recordStatus('component-install-start', { id });
+    try {
+      const result = await installComponent(id, pushComponentLog);
+      recordStatus('component-install-done', { id, ok: result.ok === true, message: String(result.message).slice(0, 200) });
+      return result;
+    } catch (error) {
+      const message = `安装出错：${describeError(error)}`;
+      pushComponentLog(message);
+      recordStatus('component-install-error', { id, message });
+      return { ok: false, message };
+    } finally {
+      componentBusy = '';
+    }
+  }
+
+  function removeComponentById(id) {
+    componentLog.length = 0;
+    pushComponentLog(`开始卸载 ${String(id)} …`);
+    try {
+      const result = removeComponent(id);
+      if (result.pending === true) pushComponentLog('文件被占用 —— 已安排重启后清理');
+      recordStatus('component-remove-done', { id, ok: result.ok === true, pending: result.pending === true });
+      return result;
+    } catch (error) {
+      const message = `卸载出错：${describeError(error)}`;
+      pushComponentLog(message);
+      recordStatus('component-remove-error', { id, message });
+      return { ok: false, message };
+    }
   }
 
   // ---- 驱动问题（踩过的大坑）：
@@ -2576,6 +2656,10 @@ export function apply(ctx, config = {}) {
       pollWeixinLogin: pollWeixinLoginOnce,
       // 设置页用：保存某个平台的凭据（宿主侧写，绕开客户端那条坏路）
       savePlatformCredential,
+      // 设置页用：可选组件（重 SDK）的安装 / 卸载 / 状态
+      getComponents: getComponentsInfo,
+      installComponent: installComponentById,
+      removeComponent: removeComponentById,
     });
   } catch (error) {
     recordStatus('status-server-start-failed', { message: String(error?.message ?? error) });

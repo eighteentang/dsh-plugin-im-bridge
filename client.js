@@ -661,6 +661,133 @@ window.__ModuleLoader__.load({
           '⚠ 四个平台的能力不同：微信 / 企业微信是**真连接**；飞书 / 钉钉目前只验证**凭据可用**（长连接还需接传输层）。'));
     }
 
+    /**
+     * 「可选组件」—— 重 SDK（飞书 30MB / 钉钉 35KB）的安装与卸载。
+     *
+     * 三条设计原则，都来自"别让用户猜"：
+     *   · **体积写在按钮旁边**，在下载**之前** —— 决策点在装之前，不是装之后能卸
+     *   · 装的时候**流式显示 pnpm 输出**，否则就是"点了没反应"
+     *   · 卸载失败不是错误：Windows 文件锁删不掉，宿主会安排"重启后清理"，
+     *     界面要把这句如实说出来，而不是丢个红字吓人
+     */
+    function ComponentSection() {
+      ensureStyle();
+      const [snap, setSnap] = React.useState(null);
+      const [busy, setBusy] = React.useState('');
+      const [note, setNote] = React.useState('');
+
+      const load = React.useCallback(async () => {
+        try {
+          const r = await fetch(`${CONTROL_BASE}/components`);
+          setSnap(await r.json());
+        } catch {
+          setSnap({ ok: false, components: [], log: [] });
+        }
+      }, []);
+
+      // 有安装任务在跑 → 1 秒刷一次（看输出）；空闲 → 5 秒
+      const hostBusy = String(snap?.busy ?? '');
+      React.useEffect(() => {
+        void load();
+        const timer = setInterval(() => { void load(); }, hostBusy === '' ? 5000 : 1000);
+        return () => clearInterval(timer);
+      }, [load, hostBusy]);
+
+      /**
+       * @param {string} url 完整地址 —— **必须在调用处用字面量拼**。
+       *
+       * ⚠ 不要用「基址 + 动态路径段」的拼法（这里最早就是那样写的）：
+       *   verify-two-sided-paths.mjs 靠**静态比对**两端路径字符串来防"只改一边"，
+       *   动态拼接它看不见，等于把这道防线关掉。
+       *   （那个写法就是被该校验器抓出来的；这里也刻意**不复述原样**，
+       *     否则注释里的反例又会被它的文本搜索命中。）
+       */
+      const act = async (url, id) => {
+        setBusy(id);
+        setNote('');
+        try {
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id }),
+          });
+          const json = await response.json();
+          if (json?.ok === false) setNote(String(json.message ?? '操作失败'));
+          else if (url.endsWith('/remove')) setNote(String(json?.message ?? '已删除'));
+          await load();
+        } catch {
+          setNote('连不上插件（Host 侧没在跑？）');
+        } finally {
+          setBusy('');
+        }
+      };
+
+      const fmt = (bytes) => {
+        if (typeof bytes !== 'number' || bytes <= 0) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB'];
+        let value = bytes;
+        let index = 0;
+        while (value >= 1024 && index < units.length - 1) { value /= 1024; index += 1; }
+        return (value >= 10 || index === 0 ? Math.round(value) : value.toFixed(1)) + ' ' + units[index];
+      };
+
+      const components = Array.isArray(snap?.components) ? snap.components : [];
+      const logLines = Array.isArray(snap?.log) ? snap.log : [];
+      const disabled = hostBusy !== '';
+
+      const rowFor = (c) => h('div', {
+        key: c.id,
+        style: {
+          display: 'flex', flexDirection: 'column', gap: 2,
+          padding: '6px 0', borderTop: '1px solid var(--dsw-alias-border-l1)',
+        },
+      },
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+        h('span', { style: { flex: '1 1 auto' } }, c.label),
+        h('span', {
+          style: {
+            fontSize: 11, marginRight: 6,
+            color: c.installed ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-label-secondary)',
+          },
+        }, c.installed
+          ? `已安装 · ${fmt(c.actualBytes)}`
+          : (c.pendingRemoval === true ? '待重启清理' : `未安装 · ${c.approxNote}`)),
+        c.installed
+          ? h('button', {
+              className: 'qqb-btn qqb-btn-ghost',
+              type: 'button',
+              disabled: busy === c.id || disabled,
+              onClick: () => { void act(`${CONTROL_BASE}/components/remove`, c.id); },
+            }, busy === c.id ? '处理中…' : '卸载')
+          : h('button', {
+              className: 'qqb-btn',
+              type: 'button',
+              disabled: busy === c.id || disabled,
+              onClick: () => { void act(`${CONTROL_BASE}/components/install`, c.id); },
+            }, busy === c.id ? '处理中…' : '安装')),
+      h('div', { className: 'qqb-hint' }, c.purpose),
+      c.caveat ? h('div', { className: 'qqb-hint', style: { opacity: 0.8 } }, `⚠ ${c.caveat}`) : null);
+
+      return h('div', { className: 'qqb-row' },
+        h('label', null, '可选组件（重 SDK —— 需要才装，装了能回收空间）'),
+        components.length === 0
+          ? h('div', { className: 'qqb-note' }, '正在读取组件状态…')
+          : h('div', null, components.map((c) => rowFor(c))),
+        note === '' ? null : h('div', { className: 'qqb-hint' }, note),
+        h('div', { className: 'qqb-hint' },
+          '装完 / 卸完都**需要重启客户端**才生效。依赖装在 ',
+          h('code', null, String(snap?.depsDir ?? '（未知）')),
+          ' —— 整个目录可以随时删掉。'),
+        logLines.length === 0 ? null : h('pre', {
+          style: {
+            maxHeight: 180, overflow: 'auto', margin: '6px 0 0', padding: '8px 10px',
+            fontSize: 11, lineHeight: 1.5, borderRadius: 8,
+            background: 'var(--dsw-alias-bg-layer-2)', color: 'var(--dsw-alias-label-secondary)',
+            whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+          },
+        }, logLines.slice(-60).join('\n')));
+    }
+
     /** 设置页：连接 QQ */
     function QqBridgeSettings() {
       ensureStyle();
@@ -823,6 +950,8 @@ window.__ModuleLoader__.load({
         h(StatusPanel, null),
         // ①′ 平台开关 —— 决定左侧边栏出现哪几个入口（不需要重启）
         h(PlatformToggles, null),
+        // ①″ 可选组件 —— 重 SDK 的安装 / 卸载（体积写在按钮旁，装了能回收空间）
+        h(ComponentSection, null),
         // ② 凭据区：**以宿主为准**（不再把空输入框当"没配"）
         credentialSection(),
         status === null ? null : h('div', {

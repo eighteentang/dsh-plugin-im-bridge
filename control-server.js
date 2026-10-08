@@ -138,7 +138,7 @@ export function readStatusSnapshot() {
  * @param {(msg: string) => void} options.log
  * @returns {{ dispose: () => void, port: number }}
  */
-export function startStatusServer({ log, getMessages, sendToAgent, listModels, setModel, getCredential, getPlatforms, setPlatform, testPlatform, pollWeixinLogin, savePlatformCredential }) {
+export function startStatusServer({ log, getMessages, sendToAgent, listModels, setModel, getCredential, getPlatforms, setPlatform, testPlatform, pollWeixinLogin, savePlatformCredential, getComponents, installComponent, removeComponent }) {
   const server = createServer((req, res) => {
     const remote = req.socket.remoteAddress ?? '';
     const origin = String(req.headers.origin ?? '');
@@ -364,6 +364,66 @@ export function startStatusServer({ log, getMessages, sendToAgent, listModels, s
             const result = await savePlatformCredential?.(String(parsed.id ?? ''), parsed.env ?? {});
             res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify(result ?? { ok: false, message: '没有 savePlatformCredential 处理函数' }));
+          } catch (error) {
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, message: String(error?.message ?? error) }));
+          }
+        });
+      })();
+      return;
+    }
+
+    // ── 设置页：可选组件（重 SDK）的状态 / 安装 / 卸载 ──
+    //
+    // ⚠ 安装**不等待**：一个 30MB 的 SDK 在慢网下要几分钟，同步回包会让
+    //   浏览器请求一直挂着（还可能被网关掐掉）。所以立即回"已开始"，
+    //   真正的进度由界面轮询 GET /components（那里带 pnpm 的流式输出）。
+    if (url.pathname === '/im-bridge/components' && req.method === 'GET') {
+      void (async () => {
+        try {
+          const payload = await getComponents?.();
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(payload ?? { ok: false, components: [], log: [] }));
+        } catch (error) {
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, components: [], log: [], error: String(error?.message ?? error) }));
+        }
+      })();
+      return;
+    }
+
+    if (url.pathname === '/im-bridge/components/install' && req.method === 'POST') {
+      void (async () => {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; if (body.length > 16 * 1024) req.destroy(); });
+        req.on('end', () => {
+          let id = '';
+          try { id = String(JSON.parse(body === '' ? '{}' : body).id ?? ''); } catch { /* ignore */ }
+          if (id === '') {
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, message: '缺少 id' }));
+            return;
+          }
+          // 故意不 await —— 见上面的说明
+          void installComponent?.(id);
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, started: true, message: '已开始安装，下面的输出会实时刷新' }));
+        });
+      })();
+      return;
+    }
+
+    if (url.pathname === '/im-bridge/components/remove' && req.method === 'POST') {
+      void (async () => {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; if (body.length > 16 * 1024) req.destroy(); });
+        req.on('end', () => {
+          let id = '';
+          try { id = String(JSON.parse(body === '' ? '{}' : body).id ?? ''); } catch { /* ignore */ }
+          try {
+            const result = removeComponent?.(id);
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(result ?? { ok: false, message: '没有 removeComponent 处理函数' }));
           } catch (error) {
             res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: false, message: String(error?.message ?? error) }));
