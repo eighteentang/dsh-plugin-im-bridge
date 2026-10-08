@@ -122,18 +122,23 @@ dsh plugin --profile web add github:你的用户名/dsh-plugin-im-bridge
 
 ```sh
 # 装某个具体版本
-dsh plugin --profile web add github:eighteentang/dsh-plugin-im-bridge#v1.1.0
+dsh plugin --profile web add github:eighteentang/dsh-plugin-im-bridge#v1.2.2
 
 # 看有哪些版本可选
 #   https://github.com/eighteentang/dsh-plugin-im-bridge/tags
 ```
+
+> ⚠ **微信用户请用 `v1.2.2` 或更新**。
+> `v1.2.1` 及更早的版本发微信回复时**缺一个 `client_id` 字段** ——
+> 表现是：日志显示发送成功（HTTP 200），但微信里**只有第一条消息出现**，
+> 之后每条都收不到。`v1.2.2` 修的就是这个。
 
 **每个版本改了什么**：见 [CHANGELOG.md](./CHANGELOG.md)。
 
 ### 升级
 
 ```sh
-dsh plugin --profile web add github:eighteentang/dsh-plugin-im-bridge#v1.2.0   # 换成的版本号
+dsh plugin --profile web add github:eighteentang/dsh-plugin-im-bridge#v1.2.2   # 换成的版本号
 ```
 
 然后**重启客户端**。
@@ -150,7 +155,7 @@ dsh plugin --profile web add github:eighteentang/dsh-plugin-im-bridge#v1.2.0   #
 看 profile 里那份 `package.json` 的 `dsh-plugin-im-bridge` 字段：
 
 ```sh
-# 装了标签版 → 显示 github:eighteentang/dsh-plugin-im-bridge#v1.1.0
+# 装了标签版 → 显示 github:eighteentang/dsh-plugin-im-bridge#v1.2.2
 # 装了浮动版 → 显示 github:eighteentang/dsh-plugin-im-bridge
 cat ~/.dsh/profiles/<profile名>/package.json
 ```
@@ -159,7 +164,8 @@ cat ~/.dsh/profiles/<profile名>/package.json
 
 ## 四、填凭据并连接
 
-打开 **设置 → 连接 IM**，填入第二步拿到的 AppID 和 AppSecret，点「连接 QQ」。
+打开 **设置 → 连接 IM**，每个平台一行：开关、完成度、连接状态、凭据都在那一行里。
+点「配置/测试」展开，填凭据，再点「保存并测试连接」。
 
 **凭据保存在哪**：本机 `~/.dsh/.credentials.yaml`，记录名 `im-bridge/bot`。
 
