@@ -1566,11 +1566,21 @@ export function apply(ctx, config = {}) {
       qq = null;
     }
     recordStatus('restart-connection', { reason });
+    // ⚠ QQ 的状态也要进 platformRuntime（2026-10-08 修）。
+    //   原来这条路径**只**调 writeStatusSnapshot（那是另一个快照对象），
+    //   而设置页读的是 `setRuntime` 写的那份 `platformRuntime` ——
+    //   于是 QQ 明明连着、能收发，界面上却一直显示初始值 "idle"，
+    //   对应词就是「未测试」。用户的原话："理论上来说，QQ 应该也是已连接才对"
+    //   —— 他是对的，是我们没有把状态报上去。
+    setRuntime('qq', 'connecting', `正在连接（${reason}）…`);
     credential = await readCredential();
     if (credential === null) {
       log(`没有可用凭据（${reason}）——请在「设置 → 连接 QQ」里填写`);
       recordStatus('no-credential', { reason });
       writeStatusSnapshot({ phase: 'no-credential', reason });
+      // 没有凭据 = 需要人动手，既不是"错误"也不是"未测试"。
+      // 界面照实说清缺什么，比一个灰扑扑的"未测试"有用得多。
+      setRuntime('qq', 'no-credential', '还没填 AppID / Secret（展开这一行填写）');
       return;
     }
     recordStatus('credential-loaded', { appId: credential.appId, reason });
@@ -1588,9 +1598,14 @@ export function apply(ctx, config = {}) {
       recordStatus('qq-event', { type });
 
       if (type === 'READY') {
-        log(`已就绪：${data.user?.username ?? '?'}`);
+        const bot = data.user?.username ?? '?';
+        log(`已就绪：${bot}`);
         recordStatus('ready', { bot: data.user?.username ?? null });
         writeStatusSnapshot({ phase: 'connected', bot: data.user?.username ?? null, sandbox: config.sandbox !== false });
+        // ★ 这一行原来漏了 —— 设置页读的是 platformRuntime，不是上面那个快照。
+        //   不写它，QQ 就会永远停在 "idle"（界面显示「未测试」），
+        //   而它其实已经能收发了。用户正是看出了这个矛盾。
+        setRuntime('qq', 'connected', `已连接 —— 机器人 ${bot}，可以收发消息`);
         return;
       }
 

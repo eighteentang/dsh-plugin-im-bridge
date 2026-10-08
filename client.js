@@ -572,6 +572,11 @@ window.__ModuleLoader__.load({
         const fields = PLATFORM_FIELDS[meta.id] ?? [];
         const expanded = openId === meta.id;
 
+        // ⚠ 开关关着的平台不该显示"未连接" —— 那读起来像出错，
+        //   而它其实是"你主动关的，没有任何问题"。所以先看开关。
+        //   （这个 const 必须在下面的 h(...) **外面** —— 参数位置是表达式，不能声明变量）
+        const phaseText = on === false ? '已关闭' : (PHASE_TEXT[phase] ?? phase);
+
         const head = h('div', {
           key: 'head',
           style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 0' },
@@ -596,16 +601,21 @@ window.__ModuleLoader__.load({
               whiteSpace: 'nowrap',
             },
           }, meta.maturity === 'full' ? '可用' : '部分')),
+        // ⚠ 开关关着的平台不该显示"未连接" —— 那读起来像出错，
+        //   而它其实是"你主动关的，没有任何问题"。所以先看开关。
         h('span', {
           style: {
             fontSize: 11,
             marginRight: 6,
-            color: phase === 'error' ? 'var(--dsw-alias-state-error-primary)'
+            color: on === false ? 'var(--dsw-alias-label-secondary)'
+              : phase === 'error' ? 'var(--dsw-alias-state-error-primary)'
               : (phase === 'connected' || phase === 'verified') ? 'var(--dsw-alias-state-success-primary)'
               : 'var(--dsw-alias-label-secondary)',
           },
-          title: String(runtime?.message ?? ''),
-        }, PHASE_TEXT[phase] ?? phase),
+          title: on === false
+            ? '这个平台被关掉了 —— 点左边那个按钮可以打开'
+            : String(runtime?.message ?? ''),
+        }, phaseText),
         h('button', {
           className: 'qqb-btn qqb-btn-ghost',
           type: 'button',
@@ -1282,13 +1292,31 @@ window.__ModuleLoader__.load({
     };
 
     /** 阶段 → 界面上那句话 + 颜色。宿主返回的 phase 是唯一真相。 */
+    /**
+     * 状态列的用词 —— 每个词都要回答"**现在能不能用**"，而不是"做没做过某个动作"。
+     *
+     * ⚠ `idle` 原来叫「未测试」（2026-10-08 改）。那个词有歧义：
+     *   字面上它是"没跑过测试这个动作"，但用户会读成
+     *   "不能用 / 没弄好 / 我是不是漏了一步"。而且它**没说清是哪一种情况** ——
+     *   开关关着、没填凭据、还没开始连，全被归进同一个词。
+     *
+     *   现在叫「未连接」，真正的信息由**运行时说明**那一行给
+     *   （宿主会写清"缺凭据"还是"正在连"还是"连接出错"），
+     *   界面这一列只管"连上没连上"这一件事实。
+     *
+     * ⚠ `no-credential` 也补了：它是"缺凭据"（要人动手），原来落到默认分支
+     *   会显示成裸的 `no-credential` 英文字符串。
+     *
+     * 判据保持唯一：宿主说 `phase === 'connected'` 才算连上。
+     */
     const PHASE_TEXT = {
-      idle: '未测试',
+      idle: '未连接',
       connecting: '连接中…',
       'need-scan': '等你扫码',
-      verified: '凭据可用',
+      'no-credential': '缺凭据',
+      verified: '已连接',
       connected: '已连接',
-      error: '出错',
+      error: '连接出错',
     };
 
     /**
