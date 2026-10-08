@@ -570,7 +570,24 @@ window.__ModuleLoader__.load({
         },
         h('span', { style: { width: 18, height: 18, flex: '0 0 auto', opacity: on ? 1 : 0.35 } },
           h(meta.art, { size: 18 })),
-        h('span', { style: { flex: '1 1 auto' } }, meta.title),
+        h('span', { style: { flex: '1 1 auto' }, title: meta.maturityText ?? '' },
+          meta.title,
+          // 完成度标签 —— **给用户看的实话**（2026-10-08 加）。
+          // 起因：提交信息与代码注释互相矛盾，连我自己都误判过"六个平台都能用"。
+          // 不做这个标签的话，别人会照着界面以为钉钉/飞书也能干活。
+          meta.maturityText === undefined ? null : h('span', {
+            style: {
+              marginLeft: 6,
+              fontSize: 10,
+              padding: '1px 5px',
+              borderRadius: 999,
+              border: '1px solid var(--dsw-alias-border-l1)',
+              color: meta.maturity === 'full'
+                ? 'var(--dsw-alias-state-success-primary)'
+                : 'var(--dsw-alias-state-warn-primary)',
+              whiteSpace: 'nowrap',
+            },
+          }, meta.maturity === 'full' ? '可用' : '部分')),
         h('span', {
           style: {
             fontSize: 11,
@@ -1073,36 +1090,67 @@ window.__ModuleLoader__.load({
      *   empty     —— 空状态与未接入状态的文案
      *   accent    —— 头部小圆点的品牌色
      */
+    /**
+     * 平台清单。
+     *
+     * ⚠ `maturity` 字段是**给用户看的实话**（2026-10-08 加）——
+     *   起因：提交信息说"钉钉/飞书真接上"，而传输层注释说"只做握手测试"，
+     *   两边不一致，我自己都差点以为六个平台都能用。
+     *
+     *   所以每个平台显式声明它能做到哪一步，设置页如实显示：
+     *     'full'     收发双向 + 已接 agent
+     *     'inbound'  能收，但**发不回去**（缺出站实现或官方未公开回复格式）
+     *     'probe'    只验证凭据可用，还没接长连接
+     *
+     *   判据来自 transports.js 的代码本体（不是注释、不是提交信息）：
+     *     qq       ✅ 收发 + 接 agent（startQqClient 那套）
+     *     weixin   ✅ 收发 + 接 agent（HTTP 长轮询，回复带 context_token）
+     *     wecom    ⚠️ 只有 startWecomLoop（收）；**回复帧形状官方未公开**
+     *     dingtalk ⚠️ 有 startDingtalkStream（收）；出站未实现，且要装 SDK 组件
+     *     feishu   ⚠️ 有 startFeishuWs（收）；出站未实现，且要装 SDK 组件
+     */
     const PLATFORMS = [
       {
         id: 'qq', panelId: 'qq-panel', title: '奇怪的企鹅', order: 20, art: PenguinArt, live: true,
+        maturity: 'full', maturityText: '完整可用 —— 收发 + agent',
         accent: '#2B2F38',
         emptyTitle: '这里是企鹅的窝',
         emptyDesc: '在手机 QQ 上给它发消息，它会在这台电脑上干活；也可以直接在下面输入 —— 两条路走的是同一个大脑。',
       },
       {
-        id: 'weixin', panelId: 'weixin-panel', title: '微信绿泡泡', order: 21, art: WeixinArt, live: false,
+        id: 'weixin', panelId: 'weixin-panel', title: '微信绿泡泡', order: 21, art: WeixinArt, live: true,
+        maturity: 'full', maturityText: '完整可用 —— 收发 + agent',
         accent: '#07C160',
         emptyTitle: '绿泡泡还没接上',
-        emptyDesc: '微信（个人号）走的是官方 iLink / ClawBot 通道：扫码换 bot_token，再用长轮询收消息 —— 免公网、不需要 SDK。传输层还没实现，先把界面和开关放上。',
+        emptyDesc: '微信（个人号）走官方 iLink / ClawBot 通道：扫码换 bot_token，再用长轮询收消息 —— 免公网、不需要 SDK。'
+          + '已接 agent：在微信里给 ClawBot 发消息，它会用这台电脑上的 agent 回答。',
       },
       {
-        id: 'feishu', panelId: 'feishu-panel', title: '飞书Bot', order: 22, art: FeishuArt, live: false,
-        accent: '#3370FF',
-        emptyTitle: '飞书还没接上',
-        emptyDesc: '飞书用官方「长连接」收事件，免公网；收发在同一个 SDK 里，是实现成本最低的一家。传输层还没实现，先把界面和开关放上。',
-      },
-      {
-        id: 'dingtalk', panelId: 'dingtalk-panel', title: '钉钉Bot', order: 23, art: DingtalkArt, live: false,
-        accent: '#3296FA',
-        emptyTitle: '钉钉还没接上',
-        emptyDesc: '钉钉用官方 Stream 模式收消息，免公网；但 Stream 通道**不能回复**，发送要另走 REST 接口。传输层还没实现，先把界面和开关放上。',
-      },
-      {
-        id: 'wecom', panelId: 'wecom-panel', title: '企业微信', order: 24, art: WecomArt, live: false,
+        id: 'wecom', panelId: 'wecom-panel', title: '企业微信', order: 22, art: WecomArt, live: false,
+        maturity: 'inbound', maturityText: '只能收 —— 发不回去',
         accent: '#2F7DFF',
-        emptyTitle: '企业微信还没接上',
-        emptyDesc: '企业微信智能机器人有官方长连接（wss://openws.work.weixin.qq.com），免公网，但**只能服务企业内部成员**。传输层还没实现，先把界面和开关放上。',
+        emptyTitle: '企业微信只能收，不能回',
+        emptyDesc: '官方长连接（wss://openws.work.weixin.qq.com）免公网，订阅 + 心跳 + 收消息都已实现；'
+          + '**但回复帧的形状官方未公开**，所以它只报"订阅成功 + 收到过几条"，不假装能回。'
+          + '只能服务企业内部成员。',
+      },
+      {
+        id: 'feishu', panelId: 'feishu-panel', title: '飞书Bot', order: 23, art: FeishuArt, live: false,
+        maturity: 'inbound', maturityText: '能收，但发不回去',
+        accent: '#3370FF',
+        emptyTitle: '飞书还没接上出站',
+        emptyDesc: '长连接走官方 SDK（`@larksuiteoapi/node-sdk` 的 WSClient，带 protobufjs 私有协议）。'
+          + '入站已实现；**出站还没做**，所以现在接不了 agent。'
+          + '要先在设置页安装可选组件，且这一家的实现成本最高。',
+      },
+      {
+        id: 'dingtalk', panelId: 'dingtalk-panel', title: '钉钉Bot', order: 24, art: DingtalkArt, live: false,
+        maturity: 'inbound', maturityText: '能收，但发不回去',
+        accent: '#3296FA',
+        emptyTitle: '钉钉还没接上出站',
+        emptyDesc: 'Stream 模式走官方 SDK（`dingtalk-stream` 的 DWClient）。'
+          + '入站已实现；**出站还没做**（Stream 通道本身不能回复，发送要另走 REST），所以现在接不了 agent。'
+          + '要先在设置页安装可选组件。',
       },
     ];
 

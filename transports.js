@@ -228,21 +228,35 @@ export async function weixinPollLogin(qrcode) {
 }
 
 /**
- * 第三步：起长轮询收消息，并**回显**。
+ * 第三步：起长轮询收消息，并把它交给上层（`onInbound`）。
  *
- * 为什么先回显而不是直接接 agent：回显能一次证明**收发两个方向都通**，
- * 而且不需要会话路由（那是下一步的事）。界面上会写明这是"测试回显"。
+ * ⚠ **不再自己回显**（2026-10-08 改）。
+ *
+ * 原来是"收到就回一条 [测试回显]"，用来证明收发两个方向都通 —— 那一步已经达成。
+ * 现在改成把**回复能力随消息一起交上去**：
+ *
+ *     onInbound(text, reply)
+ *                        ↑ 一个只对**这条消息**有效的回复函数
+ *
+ * 为什么回复函数必须逐条给，而不是给一个全局 send：
+ * 微信的回复**必须原样带上那条消息的 `context_token`**，否则关联不到会话。
+ * 也就是说"能不能回这条消息"是**消息级别的属性**，不是连接级别的。
+ * 硬做一个全局 send 就得自己维护 token 映射，反而更容易错。
  *
  * @param {object} options
  * @param {string} options.token   bot_token
- * @param {(text: string) => void} options.onInbound  收到消息（用于写日志/状态）
+ * @param {(text: string, reply: (replyText: string) => Promise<void>) => void} options.onInbound
+ *        收到用户消息。`reply` 只对本次调用收到的这条消息有效。
  * @param {(event: string, detail?: object) => void} options.onEvent
- * @returns {{ dispose: () => void }}
+ * @returns {{ dispose: () => void, sendTo: (peer: string, text: string) => Promise<void> | undefined }}
+ *        `sendTo` 只在**最近一条**消息的 context 上可用（逃生口，正常路径请用 onInbound 给的 reply）
  */
 export function startWeixinLoop({ token, onInbound, onEvent }) {
   let stopped = false;
   let cursor = '';
   let failures = 0;
+  /** 最近一条入站消息 —— 只为 sendTo 这个逃生口保留 */
+  let lastMessage = null;
 
   const post = async (path, body) => {
     const response = await fetchWithTimeout(
@@ -253,8 +267,14 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
     return await response.json();
   };
 
-  /** 回显一条文本。必须原样带上 inbound 的 context_token，否则关联不到会话。 */
-  const echo = async (message, text) => {
+  /**
+   * 回一条文本。必须原样带上 `message.context_token`，否则关联不到会话。
+   *
+   * ⚠ 失败**不上抛**，只记事件 —— 但会把成功/失败都报给 onEvent，
+   *   这样上层能区分"发出去了"和"发失败了"（原来两者都只是静默）。
+   *   返回 boolean 让调用方能据此决定要不要重试。
+   */
+  const sendTo = async (message, text) => {
     const body = {
       msg: {
         to_user_id: message.from_user_id,
@@ -267,8 +287,10 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
     try {
       await post('ilink/bot/sendmessage', body);
       onEvent?.('weixin-replied', { bytes: text.length });
+      return true;
     } catch (error) {
       onEvent?.('weixin-reply-failed', { message: describeError(error) });
+      return false;
     }
   };
 
@@ -289,8 +311,9 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
           const text = String(message?.item_list?.[0]?.text_item?.text ?? '').trim();
           if (text === '') continue;
           onEvent?.('weixin-inbound', { chars: text.length });
-          onInbound?.(text);
-          await echo(message, `[测试回显] 收到：${text}`);
+          lastMessage = message;
+          // 把这条消息专属的回复闭包交上去
+          onInbound?.(text, (replyText) => sendTo(message, replyText));
         }
       } catch (error) {
         if (stopped) return;
@@ -307,6 +330,11 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
   return {
     dispose() {
       stopped = true;
+    },
+    /** 逃生口：往"最近一条消息的发送者"回一条。正常路径请用 onInbound 给的 reply。 */
+    sendTo(peer, text) {
+      if (lastMessage === null) return undefined;
+      return sendTo(lastMessage, text);
     },
   };
 }

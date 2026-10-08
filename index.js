@@ -893,16 +893,36 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /** 微信：起长轮询 + 测试回显（先证明收发两个方向都通，再谈接 agent） */
+  /**
+   * 微信：起长轮询，把入站消息**接到 agent**（2026-10-08 改）。
+   *
+   * 改之前是"收到就回一条 [测试回显]"—— 那一步的使命是证明收发双向都通，
+   * 已经达成。现在改成真正的闭环：
+   *
+   *     微信消息 → enqueueDelivery(微信会话, …) → agent 干活
+   *              → finishTurn → slot.reply（带那条消息的 context_token）→ 微信
+   *
+   * ⚠ 两处与 QQ 不同，都要注意：
+   *   ① **回复闭包必须逐条传**：微信的回复要带 inbound 的 context_token，
+   *      所以它是消息级能力（见 transports.js 里 startWeixinLoop 的说明）。
+   *   ② **微信有自己的专用会话**（`im-bridge-weixin-v1`），与 QQ 分开。
+   *      这样两个平台的上下文互不干扰，面板也能按平台分开展示。
+   */
   function startWeixinWithLoop(token) {
     if (weixinLoop !== null) { weixinLoop.dispose(); weixinLoop = null; }
+    const weixinSessionId = dedicatedSessionId('weixin');
     weixinLoop = startWeixinLoop({
       token,
-      onInbound: (text) => { recordStatus('weixin-inbound-text', { text: text.slice(0, 80) }); },
+      onInbound: (text, reply) => {
+        recordStatus('weixin-inbound-text', { text: text.slice(0, 80) });
+        // peer 用不了 openid（微信是 from_user_id），这里从闭包里拿不到，
+        // 所以队列键用会话 id —— 微信是单聊场景，不需要再按人分。
+        enqueueDelivery(weixinSessionId, text, '', undefined, { platform: 'weixin', reply });
+      },
       onEvent: (event, detail) => {
         recordStatus(event, detail ?? {});
         if (event === 'weixin-replied') {
-          setRuntime('weixin', 'connected', '已连接 —— 测试回显工作中（发消息会收到「测试回显」）');
+          setRuntime('weixin', 'connected', '已连接 —— 给「微信 ClawBot」发消息，它会用 agent 回答');
         }
         if (event === 'weixin-reply-failed') {
           setRuntime('weixin', 'error', `能收但回不出去：${detail?.message ?? ''}`);
@@ -912,8 +932,8 @@ export function apply(ctx, config = {}) {
         }
       },
     });
-    setRuntime('weixin', 'connected', '长轮询已启动（测试回显）—— 现在给「微信 ClawBot」发一条消息试试');
-    return { ok: true, message: '已连接：去微信里给 ClawBot 发一条消息，它会回显给你', phase: 'connected' };
+    setRuntime('weixin', 'connected', '长轮询已启动 —— 现在给「微信 ClawBot」发一条消息试试');
+    return { ok: true, message: '已连接：去微信里给 ClawBot 发一条消息，它会让 agent 回答', phase: 'connected' };
   }
 
   /**
@@ -1678,11 +1698,17 @@ export function apply(ctx, config = {}) {
    * 也就是说两条 QQ 消息先后到达时，会合并成一个回合、只产生一个回答 ——
    * 那样两条消息只能收到一个回复。串行化可以保证"一条消息一个回答"。
    */
-  function enqueueDelivery(sessionId, text, openid, msgId) {
+  function enqueueDelivery(sessionId, text, openid, msgId, opts = {}) {
     const list = queues.get(sessionId) ?? [];
-    list.push({ text, openid, msgId });
+    // `opts` 承载"这条消息从哪来、怎么回"——多平台引入的（2026-10-08）。
+    //    platform  —— 'qq' / 'weixin' / …（决定回复走哪个传输）
+    //    reply     —— **这条消息专属**的回复闭包。
+    //                 ⚠ 微信的回复必须带上那条消息的 context_token，
+    //                 所以它是消息级能力，不能用一个全局 send 代替。
+    //                 为 undefined 时退回旧的"按平台查表"路径。
+    list.push({ text, openid, msgId, platform: opts.platform ?? 'qq', reply: opts.reply });
     queues.set(sessionId, list);
-    recordStatus('queued', { sessionId, pending: list.length });
+    recordStatus('queued', { sessionId, platform: opts.platform ?? 'qq', pending: list.length });
     pumpQueue(sessionId).catch((error) => {
       recordStatus('pump-failed', { sessionId, message: String(error?.message ?? error) });
     });
@@ -1754,13 +1780,30 @@ export function apply(ctx, config = {}) {
         });
         // 放弃之前**先告诉用户** —— 否则手机那头是"石沉大海"。
         // 这条走主动推送（没有 msg_id 可用），失败也无所谓。
+        //
+        // ⚠ 按平台选通道（2026-10-08 改）：原来写死 `qq?.reply`，
+        //   微信场景下它会是 undefined → **提示静默不发**。
         const stuck = queues.get(sessionId) ?? [];
+        const notice = '（上一条还在处理，请稍后再发一次）';
         if (stuck.length > 0) {
-          qq?.reply(stuck[0].openid, '（上一条还在处理，请稍后再发一次）', undefined, (ev, d) => {
-            recordStatus(ev, d);
-          }).catch((error) => {
-            recordStatus('pump-give-up-notice-failed', { message: String(error?.message ?? error) });
-          });
+          const job = stuck[0];
+          const send = typeof job.reply === 'function'
+            // 消息级回复闭包优先（微信必需，它要带 context_token）
+            ? () => job.reply(notice)
+            : (job.platform ?? 'qq') === 'qq' && qq !== null
+              ? () => qq.reply(job.openid, notice, undefined, (ev, d) => recordStatus(ev, d))
+              : null;
+          if (send === null) {
+            recordStatus('pump-give-up-notice-skipped', {
+              sessionId,
+              platform: job.platform ?? 'qq',
+              note: '这个平台没有可用的发送通道，提示发不出去',
+            });
+          } else {
+            Promise.resolve(send()).catch((error) => {
+              recordStatus('pump-give-up-notice-failed', { message: String(error?.message ?? error) });
+            });
+          }
         }
         return;
       }
@@ -1777,7 +1820,10 @@ export function apply(ctx, config = {}) {
     markBusy(sessionId);
     recordStatus('pump-delivering', { sessionId, remaining: list.length });
     try {
-      await deliverToAgent(sessionId, job.text, job.openid, job.msgId);
+      await deliverToAgent(sessionId, job.text, job.openid, job.msgId, {
+        platform: job.platform,
+        reply: job.reply,
+      });
     } catch (error) {
       clearBusy(sessionId);
       recordStatus('deliver-failed-in-pump', { sessionId, message: String(error?.message ?? error) });
@@ -1860,6 +1906,23 @@ export function apply(ctx, config = {}) {
   const DEDICATED_SESSION_ID = 'im-bridge-dedicated-v1';
 
   /**
+   * 按平台派生"专用会话 id"（2026-10-08 加，多平台引入）。
+   *
+   * 为什么要按平台分：
+   *   · 各平台的上下文互不干扰（微信里的对话不会串到 QQ 的会话里）
+   *   · 面板能按平台分开（client.js 里每个平台已注册独立 panelId）
+   *   · 每个平台可以有不同的模型 / 权限设置
+   *
+   * ⚠ **QQ 必须保持原 id**（`im-bridge-dedicated-v1`，注意没有平台中缀）：
+   *   那个会话有历史，改了前缀等于**丢历史** —— 上次从 qq-bridge 改名到 im-bridge
+   *   已经丢过一次（v3/v4 三代），不该再丢一次。
+   *   所以这里对 qq 做特例，其余平台用 `im-bridge-<平台>-v1`。
+   */
+  function dedicatedSessionId(platform) {
+    return platform === 'qq' ? DEDICATED_SESSION_ID : `im-bridge-${platform}-v1`;
+  }
+
+  /**
    * 取得"专用 QQ 会话"的 agent。
    *
    * 为什么不复用用户正在用的会话（这是上一版的错误）：
@@ -1871,9 +1934,11 @@ export function apply(ctx, config = {}) {
    * 用 parentAgent 把生命周期挂到一个活动 root agent 上，
    * 这样它由 DSH 的工厂创建并驱动，apply 返回时 loop 已在运行。
    */
-  async function resolveTargetAgent() {
+  async function resolveTargetAgent(platform = 'qq') {
+    const sessionId = dedicatedSessionId(platform);
+
     // ① 已存在就直接用
-    const existing = ctx.agents.get(DEDICATED_SESSION_ID);
+    const existing = ctx.agents.get(sessionId);
     if (existing !== undefined) return { agent: existing, kind: 'dedicated' };
 
     // ② 复用已持久化的会话 → resume
@@ -1894,7 +1959,7 @@ export function apply(ctx, config = {}) {
     recordStatus('resume-agent-options', { agentOptions: resumeAgentOptions ?? null });
     try {
       const handle = await ctx.agents.resume({
-        resumeSessionId: DEDICATED_SESSION_ID,
+        resumeSessionId: sessionId,
         ...(resumeOwner === undefined ? {} : { parentAgent: resumeOwner }),
         ...(resumeAgentOptions === undefined ? {} : { agentOptions: resumeAgentOptions }),
         setup: async (agentCtx, agent) => {
@@ -1902,7 +1967,8 @@ export function apply(ctx, config = {}) {
         },
       });
       recordStatus('dedicated-resumed', {
-        sessionId: DEDICATED_SESSION_ID,
+        sessionId,
+        platform,
         owner: resumeOwner === undefined ? null : String(resumeOwner.id),
         hasAgentOptions: resumeAgentOptions !== undefined,
       });
@@ -1942,7 +2008,7 @@ export function apply(ctx, config = {}) {
     //
     // 具体的 create 调用（含 meta.origin='subagent' 的理由、以及
     // "id 已在磁盘上"的兜底）都在 createDedicatedAgent 里，见它的注释。
-    return createDedicatedAgent(owner, workspace, presetId, 0);
+    return createDedicatedAgent(owner, workspace, presetId, 0, platform);
   }
 
   /**
@@ -1967,16 +2033,17 @@ export function apply(ctx, config = {}) {
    * 后果太重（QQ 完全不可用），所以这里加一层兜底：换唯一 id 重建。
    * 代价是**多留一个孤儿会话文件** —— 而它是内部会话，不进列表，可以接受。
    */
-  async function createDedicatedAgent(owner, workspace, presetId, attempt) {
+  async function createDedicatedAgent(owner, workspace, presetId, attempt, platform = 'qq') {
     const agentOptions = await readDefaultModelOptions(ctx, config);
-    recordStatus('agent-options-resolved', { agentOptions: agentOptions ?? null, attempt });
+    recordStatus('agent-options-resolved', { agentOptions: agentOptions ?? null, attempt, platform });
     if (agentOptions === undefined) {
       log('⚠ 没能解析出模型（provider/model）—— agent 可能因缺少 {{model}} 而整轮失败');
     }
 
+    const baseId = dedicatedSessionId(platform);
     const sessionId = attempt === 0
-      ? DEDICATED_SESSION_ID
-      : `${DEDICATED_SESSION_ID}-${Date.now().toString(36)}`;   // 唯一化，绕开冲突
+      ? baseId
+      : `${baseId}-${Date.now().toString(36)}`;   // 唯一化，绕开冲突
 
     try {
       const handle = await ctx.agents.create({
@@ -2045,8 +2112,9 @@ export function apply(ctx, config = {}) {
    *
    * 用文档里的公开 API，而不是猜底层结构。
    */
-  async function deliverToAgent(fallbackSessionId, text, openid, msgId) {
-    const { agent, kind } = await resolveTargetAgent();
+  async function deliverToAgent(fallbackSessionId, text, openid, msgId, opts = {}) {
+    const platform = opts.platform ?? 'qq';
+    const { agent, kind } = await resolveTargetAgent(platform);
 
     /**
      * 权限预设必须在**这里**设，不能在 `setup` 回调里（2026-09-26 实测踩到）。
@@ -2065,8 +2133,14 @@ export function apply(ctx, config = {}) {
      *
      * 为什么还赶得上"第一轮之前"：投递发生在下面几行的 `agent.followup()`，
      * 而权限决定的是 shell 工具**怎么起沙箱** —— 只要在 followup 之前设好就够。
+     *
+     * ⚠ 传 `agent.id` 而不是 `DEDICATED_SESSION_ID`（2026-10-08 改）：
+     *   `DEDICATED_SESSION_ID` 是 QQ 的会话 id，多平台引入后会**设错会话**
+     *   （微信的权限被设到 QQ 会话上）。而 `agent.id === agent.session.id`
+     *   （DSH 有这条不变量，见 dsh-agent 的 enter()），所以用 agent.id 一定对。
+     *   它还顺带覆盖了"会话 id 撞车后换了唯一 id"那条路。
      */
-    applyPermissionPreset(DEDICATED_SESSION_ID);
+    applyPermissionPreset(agent.id);
 
     const message = {
       id: randomUUID(),                 // MessageId 是品牌化字符串，运行时用 uuid
@@ -2076,7 +2150,19 @@ export function apply(ctx, config = {}) {
     };
 
     recordStatus('deliver-target', { sessionId: agent.id, kind });
-    pending.set(agent.id, { text: '', reasoning: '', messages: [], openid, msgId });
+    // pending 里多存 platform / reply —— finishTurn 靠它们决定"往哪里回、用什么回"。
+    // 之前只存 openid / msgId，而 finishTurn 里写死了 `qq.reply(...)`，
+    // 于是"非 QQ 平台接 agent"这件事根本无处落地（2026-10-08 改）。
+    pending.set(agent.id, {
+      text: '',
+      reasoning: '',
+      messages: [],
+      openid,
+      msgId,
+      platform: opts.platform ?? 'qq',
+      // 消息级回复闭包（微信必需）；为 undefined 时 finishTurn 退回按平台查表
+      reply: opts.reply,
+    });
 
     // ⚠ 把**会话键也登记进 busy**（关键修复，2026-09-26）：
     //   到目前为止 busy 只认了队列键（pumpQueue 里 markBusy(sessionId)），
@@ -2550,16 +2636,27 @@ export function apply(ctx, config = {}) {
 
     recordStatus('finish-turn', { sessionId, reason, bytes: reply.length, source: collected.trim() !== '' ? 'assistant-message' : 'streamed' });
 
-    // ── 面板来的消息：**不回报给 QQ** ────────────────────────────────────
+    // ── 面板来的消息：**不回报出去** ──────────────────────────────────────
     //
-    // 判据是 `slot.openid === ''` —— 只有 sendPanelMessage 会传空。
+    // 判据**不能只看 `slot.openid === ''`**（2026-10-08 修）。
     //
-    // 为什么必须区分：面板里是**用户本人在电脑上打的字**，QQ 那边没有对应的提问。
-    // 如果把回答推到手机上，用户会收到一条莫名其妙的、自己没问过的消息。
+    // 原来只判 openid 为空 —— 那时只有 sendPanelMessage 会传空，所以成立。
+    // 但多平台引入后**微信也传空 openid**（它没有 openid 这个概念，只有
+    // from_user_id，而回复靠消息级的 reply 闭包）。于是微信的回答会被
+    // 当成"面板输入"，直接走这一支**静默不回复** —— 一个只有真机才暴露的 bug。
+    //
+    // 正确判据：既没有 openid，**也没有可用的回复闭包**。
+    //   · 面板：openid='' + reply=undefined → 不回复 ✓
+    //   · 微信：openid='' + reply=函数     → 要回复 ✓
+    //   · QQ  ：openid 非空                → 要回复 ✓
+    //
+    // 为什么必须区分：面板里是**用户本人在电脑上打的字**，手机上没有对应的提问。
+    // 如果把回答推过去，用户会收到一条莫名其妙的、自己没问过的消息。
     //
     // 但仍然要走 `.finally()` 的解忙 + 泵队列，否则队列会卡住。
-    if (slot.openid === '') {
-      log(`面板输入已回答（${reply.length} 字符）—— 不回发 QQ`);
+    const hasReplyChannel = typeof slot.reply === 'function';
+    if (slot.openid === '' && !hasReplyChannel) {
+      log(`面板输入已回答（${reply.length} 字符）—— 不回发`);
       recordStatus('panel-answered', { sessionId, bytes: reply.length });
       // clearBusy 会把这一"忙"的**全部别名**（队列键 + 会话键）一起清掉 ——
       // 只清 sessionId 正是之前那个 bug（见 busyAliases 的说明）。
@@ -2579,13 +2676,38 @@ export function apply(ctx, config = {}) {
     }
 
     // 发送闭包 —— 首次尝试与后台重试走**同一个**它，保证两条路完全一致
+    //
+    // ⚠ 这里原来是写死的 `qq.reply(slot.openid, reply, slot.msgId, …)`，
+    //   于是"非 QQ 平台接 agent"无处落地（2026-10-08 改）。
+    //   现在分两条路：
+    //     ① `slot.reply` 存在 → 用它。**微信必需**：它的回复要带那条消息的
+    //        context_token，是消息级能力，不能用一个全局 send 替代。
+    //     ② 否则 → 按 `slot.platform` 查表（QQ 走这条，行为与原来完全一致）
     const sendReply = () => {
-      if (qq === null) throw new Error('连接已释放（qq 为 null）');
-      return qq.reply(slot.openid, reply, slot.msgId, (event, detail) => {
-        // 记下 QQ 返回的 message id / 时间戳 —— 出问题时能拿它们去 QQ 侧查，
-        // 只记字节数是不够的（"发出去了但收不到"就是这么漏掉的）
-        recordStatus(event, detail);
-      });
+      const platform = slot.platform ?? 'qq';
+
+      if (typeof slot.reply === 'function') {
+        return slot.reply(reply).then((ok) => {
+          // 传输层自己报的成功/失败已经写进事件了；这里只在明确失败时抛，
+          // 让上面的 catch 走后台重试（编造成功比报错更糟）。
+          if (ok === false) throw new Error(`${platform} 传输层报告发送失败`);
+        });
+      }
+
+      if (platform === 'qq') {
+        if (qq === null) throw new Error('连接已释放（qq 为 null）');
+        return qq.reply(slot.openid, reply, slot.msgId, (event, detail) => {
+          // 记下 QQ 返回的 message id / 时间戳 —— 出问题时能拿它们去 QQ 侧查，
+          // 只记字节数是不够的（"发出去了但收不到"就是这么漏掉的）
+          recordStatus(event, detail);
+        });
+      }
+
+      // 走到这里说明：这个平台还没实现出站，却有人把消息投进来了 —— 那是接线错误
+      throw new Error(
+        `平台「${platform}」没有可用的发送通道（未实现出站，或回复闭包没传下来）。`
+        + '见 transports.js 顶部的能力表：目前只有 QQ 与微信能发消息。',
+      );
     };
 
     sendReply()
@@ -2599,7 +2721,12 @@ export function apply(ctx, config = {}) {
         recordStatus('reply-failed', { message: error.message });
         // ⚠ 这里**不 await**：重试在后台跑，下面 finally 里的解忙 / 泵队列
         //   照常立刻执行。否则一次网络抖动会把整条队列按死 30 秒。
-        scheduleReplyRetry(sendReply, { bytes: reply.length, openid: String(slot.openid).slice(0, 12) });
+        scheduleReplyRetry(sendReply, {
+          bytes: reply.length,
+          platform: slot.platform ?? 'qq',
+          // openid 在微信上是空串（它没有 openid），记平台名才有排查价值
+          peer: String(slot.openid ?? '').slice(0, 12) || `(${slot.platform ?? 'qq'})`,
+        });
       })
       .finally(() => {
         // ⚠ 先解忙、再泵队列 —— 顺序不能反。
