@@ -28,6 +28,46 @@
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * 给一个 Promise 套超时。
+ *
+ * ⚠ 为什么必须有：SDK 的 `connect()` / `start()` **可能在内部自己重试而不 reject**。
+ *   那样 `await` 会永远挂着，界面就停在"连接中…" —— 正是"点了没反应"那类问题。
+ *   所以每个可能长时间不返回的调用都要有上界。
+ */
+function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * 轮询等待某个条件成立。
+ *
+ * ⚠ 为什么两个长连接都需要它：**两个 SDK 的 start/connect resolve 都不代表"连上了"**。
+ *   · 钉钉 `DWClient.connect()` 会把失败吞进重连循环后照常 resolve；
+ *     `connected` 才是在 `socket.on('open')` 里被置 true 的（读 client.cjs 确认）。
+ *   · 飞书 `WSClient.start()` 立即 resolve，真正的状态在
+ *     `getConnectionStatus().state`（idle/connecting/connected/reconnecting/failed）。
+ *   只按"调用没抛错"就报"已连接"，就是在骗用户。
+ */
+async function waitFor(predicate, timeoutMs, intervalMs = 250) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      if (predicate() === true) return true;
+    } catch { /* 谓词自己抛错就当没就绪 */ }
+    if (Date.now() >= deadline) return false;
+    await sleep(intervalMs);
+  }
+}
+
+// ⚠ 只有"长连接"才需要可选组件；下面的 REST 握手测试不用，所以这条 import
+//   不会让插件在未安装组件时加载失败（loadComponentPackage 是**可失败的**）。
+import { loadComponentPackage } from './components.js';
+
 /** 带超时的 fetch —— 所有网络调用都必须有超时，否则界面会一直转圈。 */
 async function fetchWithTimeout(url, options = {}, timeoutMs = 10_000) {
   const controller = new AbortController();
@@ -40,8 +80,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 10_000) {
 }
 
 /** 把未知错误变成一句人话（网络类错误 pnpm/Node 的原文对用户没意义）。 */
-function describeError(error) {
-  const message = String(error?.message ?? error);
+function describeError(error) {  const message = String(error?.message ?? error);
   if (error?.name === 'AbortError') return '请求超时';
   if (/ENOTFOUND|EAI_AGAIN/.test(message)) return '域名解析失败（检查网络/DNS）';
   if (/ECONNREFUSED|ECONNRESET|socket hang up/i.test(message)) return '连接被拒绝或中断';
@@ -386,3 +425,154 @@ export function startWecomLoop({ botId, secret, onInbound, onEvent }) {
 }
 
 export { describeError };
+
+// ---------------------------------------------------------------- 长连接（需要可选组件）
+
+/**
+ * 钉钉 Stream 长连接。
+ *
+ * ⚠ 必须走官方 SDK：Stream 是私有 WebSocket 帧协议，手写要逆向。
+ *   所以先检查"可选组件"装没装，没装就**明确告诉用户去哪装**（约 35KB）。
+ *
+ * API 依据（读 SDK 的 .d.ts + 实测构造，不是凭记忆）：
+ *   `DWClientConfig = { clientId, clientSecret, keepAlive?, debug?, autoReconnect? }`
+ *   `DWClientDownStream = { type, headers: { messageId, topic }, data: string }`
+ *   `TOPIC_ROBOT = '/v1.0/im/bot/messages/get'`
+ * 方法：`registerCallbackListener(eventId, cb)` / `connect()` / `disconnect()`
+ */
+export async function startDingtalkStream({ clientId, clientSecret, onInbound, onEvent }) {
+  const mod = await loadComponentPackage('dingtalk-stream');
+  if (mod === null) {
+    return {
+      ok: false,
+      message: '长连接组件没装 —— 先在设置页的「可选组件」里装「钉钉长连接」（约 35 KB）',
+    };
+  }
+  const bag = { ...(mod.default ?? {}), ...mod };
+  const DWClient = bag.DWClient;
+  const TOPIC_ROBOT = bag.TOPIC_ROBOT ?? '/v1.0/im/bot/messages/get';
+  if (typeof DWClient !== 'function') {
+    return { ok: false, message: '组件里没有 DWClient —— 版本对不上？重装一次试试' };
+  }
+
+  const client = new DWClient({ clientId, clientSecret, autoReconnect: true, debug: false });
+  client.registerCallbackListener(TOPIC_ROBOT, (down) => {
+    try {
+      // data 是**字符串**（SDK 的类型声明如此），要自己 JSON.parse
+      const message = JSON.parse(String(down?.data ?? '{}'));
+      const text = String(message?.text?.content ?? '').trim();
+      onEvent?.('dingtalk-inbound', {
+        conversationType: String(message?.conversationType ?? ''),
+        chars: text.length,
+      });
+      if (text !== '') onInbound?.(text);
+    } catch (error) {
+      onEvent?.('dingtalk-parse-failed', { message: describeError(error) });
+    }
+  });
+
+  try {
+    // 15 秒上界：SDK 可能内部重试而不 reject，没有上界界面就会一直"连接中…"
+    await withTimeout(client.connect(), 15_000, '连接钉钉网关超时（15 秒）—— 检查网络或凭据');
+  } catch (error) {
+    try { client.disconnect(); } catch { /* ignore */ }
+    return { ok: false, message: `连不上钉钉网关：${describeError(error)}` };
+  }
+
+  // ⚠ connect() resolve **不等于**连上了（看上面的说明）—— 必须等 connected 真的为 true
+  const ready = await waitFor(() => client.connected === true, 10_000, 250);
+  if (ready !== true) {
+    try { client.disconnect(); } catch { /* ignore */ }
+    return {
+      ok: false,
+      message: 'Stream 长连接没能建立（网关一直没回 open）—— 凭据可能不对，或网络/防火墙挡了 WebSocket',
+    };
+  }
+  onEvent?.('dingtalk-connected', {});
+  return {
+    ok: true,
+    message: 'Stream 长连接已建立（能收消息；钉钉的 Stream 通道本身不能回复）',
+    dispose() {
+      try { client.disconnect(); } catch { /* ignore */ }
+    },
+  };
+}
+
+/**
+ * 飞书长连接。
+ *
+ * API 依据（读 SDK 导出 + 实测构造，不是凭记忆）：
+ *   导出 `Client` / `WSClient` / `EventDispatcher` / `LoggerLevel`
+ *   `WSClient` 方法：`start({ eventDispatcher })` / `close()` / `getConnectionStatus()`
+ *   `EventDispatcher` 方法：`register({ 事件名: handler })`
+ *
+ * ⚠ 装完 SDK **还没完**：飞书后台的「事件与回调 → 事件配置」必须切成
+ *   「使用长连接接收事件」，**而且那一步保存时要求已有客户端在线**。
+ *   所以正确顺序是：先装组件 → 点连接（这里会开始收）→ 再回后台点保存。
+ */
+export async function startFeishuWs({ appId, appSecret, onInbound, onEvent }) {
+  const mod = await loadComponentPackage('@larksuiteoapi/node-sdk');
+  if (mod === null) {
+    return {
+      ok: false,
+      message: '长连接组件没装 —— 先在设置页的「可选组件」里装「飞书长连接」（约 30 MB）',
+    };
+  }
+  const bag = { ...(mod.default ?? {}), ...mod };
+  const WSClient = bag.WSClient;
+  const EventDispatcher = bag.EventDispatcher;
+  if (typeof WSClient !== 'function' || typeof EventDispatcher !== 'function') {
+    return { ok: false, message: '组件里没有 WSClient / EventDispatcher —— 版本对不上？重装一次试试' };
+  }
+
+  const dispatcher = new EventDispatcher({}).register({
+    'im.message.receive_v1': async (data) => {
+      try {
+        const message = data?.message ?? {};
+        const raw = String(message?.content ?? '');
+        // content 是 JSON 字符串（例如 {"text":"你好"}），解析失败就按纯文本用
+        let text = raw;
+        try { text = String(JSON.parse(raw)?.text ?? raw); } catch { /* 保持 raw */ }
+        text = text.trim();
+        onEvent?.('feishu-inbound', { chatType: String(message?.chat_type ?? ''), chars: text.length });
+        if (text !== '') onInbound?.(text);
+      } catch (error) {
+        onEvent?.('feishu-parse-failed', { message: describeError(error) });
+      }
+    },
+  });
+
+  let ws;
+  try {
+    ws = new WSClient({ appId, appSecret });
+    await withTimeout(ws.start({ eventDispatcher: dispatcher }), 20_000, '建立飞书长连接超时（20 秒）');
+  } catch (error) {
+    try { ws?.close?.(); } catch { /* ignore */ }
+    return { ok: false, message: `连不上飞书长连接：${describeError(error)}` };
+  }
+
+  // ⚠ start() 会**立即 resolve**，真正连上没有要问 getConnectionStatus()
+  const stateOf = () => {
+    try { return ws.getConnectionStatus()?.state; } catch { return undefined; }
+  };
+  const ready = await waitFor(() => stateOf() === 'connected', 12_000, 300);
+  if (ready !== true) {
+    const state = stateOf();
+    try { ws.close(); } catch { /* ignore */ }
+    return {
+      ok: false,
+      message: state === 'failed'
+        ? '飞书返回 failed —— 通常是应用没有开启长连接能力，或 App ID/Secret 不对'
+        : `长连接没能建立（状态停在 ${String(state ?? '未知')}）—— 检查网络，或应用是否已开启长连接`,
+    };
+  }
+  onEvent?.('feishu-connected', {});
+  return {
+    ok: true,
+    message: '长连接已建立（记得去飞书后台把「事件配置」切成「使用长连接接收事件」）',
+    dispose() {
+      try { ws.close(); } catch { /* ignore */ }
+    },
+  };
+}
+

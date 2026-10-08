@@ -37,12 +37,15 @@ import {
   weixinPollLogin,
   startWeixinLoop,
   startWecomLoop,
+  startDingtalkStream,
+  startFeishuWs,
   describeError,
 } from './transports.js';
 import {
   applyPendingRemovals,
   DEPS_DIR,
   installComponent,
+  isInstalled as isComponentInstalled,
   listComponents,
   removeComponent,
 } from './components.js';
@@ -851,6 +854,8 @@ export function apply(ctx, config = {}) {
 
   let weixinLoop = null;
   let wecomLoop = null;
+  let dingtalkLoop = null;
+  let feishuLoop = null;
   let weixinLogin = null;   // { qrcode, qrUrl, startedAt }
 
   /** 微信 bot_token 存在本机 —— 重启后不用重新扫码 */
@@ -935,10 +940,45 @@ export function apply(ctx, config = {}) {
 
     if (id === 'feishu') {
       const env = await readPlatformEnv(id);
-      const result = await probeFeishu({
-        appId: String(env.FEISHU_APP_ID ?? '').trim(),
-        appSecret: String(env.FEISHU_APP_SECRET ?? '').trim(),
-      });
+      const appId = String(env.FEISHU_APP_ID ?? '').trim();
+      const appSecret = String(env.FEISHU_APP_SECRET ?? '').trim();
+      if (appId === '' || appSecret === '') {
+        const message = '请先填 App ID 和 App Secret（展开这一行有开通指引）';
+        setRuntime(id, 'error', message);
+        return { ok: false, phase: 'error', message };
+      }
+
+      // 装了长连接组件 → 起**真连接**；没装 → 退回"只验证凭据"并告诉用户去哪装
+      if (isComponentInstalled('lark-sdk')) {
+        // ⚠ 先做一次 REST 握手：它能给出**精确**的失败原因（App ID 错 / Secret 错 / 未开通），
+        //   而长连接失败只能告诉你"没连上"。顺序反了用户就得猜。
+        const probe = await probeFeishu({ appId, appSecret });
+        if (probe.ok !== true) {
+          setRuntime(id, 'error', `凭据不通：${probe.message}`);
+          return { ok: false, phase: 'error', message: probe.message };
+        }
+        try { feishuLoop?.dispose(); } catch { /* ignore */ }
+        feishuLoop = null;
+        setRuntime(id, 'connecting', '正在建立长连接…');
+        const started = await startFeishuWs({
+          appId,
+          appSecret,
+          onInbound: (text) => recordStatus('feishu-inbound-text', { text: text.slice(0, 80) }),
+          onEvent: (event, detail) => recordStatus(event, detail ?? {}),
+        });
+        if (started.ok !== true) {
+          setRuntime(id, 'error', started.message);
+          return { ok: false, phase: 'error', message: started.message };
+        }
+        feishuLoop = started;
+        setRuntime(id, 'connected', started.message);
+        return { ok: true, phase: 'connected', message: started.message };
+      }
+
+      const result = await probeFeishu({ appId, appSecret });
+      if (result.ok === true) {
+        result.message += '；⚠ 长连接组件未安装 —— 现在只能验证凭据，要在「可选组件」里装「飞书长连接」才能收消息';
+      }
       setRuntime(id, result.ok ? 'verified' : 'error', result.message, result.detail);
       return { ...result, phase: result.ok ? 'verified' : 'error' };
     }
@@ -948,13 +988,47 @@ export function apply(ctx, config = {}) {
       const clientId = String(env.DINGTALK_CLIENT_ID ?? '').trim();
       const clientSecret = String(env.DINGTALK_CLIENT_SECRET ?? '').trim();
       const robotCode = String(env.DINGTALK_ROBOT_CODE ?? '').trim();
+      if (clientId === '' || clientSecret === '') {
+        const message = '请先填 Client ID（AppKey）和 Client Secret（AppSecret）';
+        setRuntime(id, 'error', message);
+        return { ok: false, phase: 'error', message };
+      }
+
+      if (isComponentInstalled('dingtalk-stream')) {
+        // ⚠ 同飞书：先验凭据拿到精确原因，再起长连接
+        const probe = await probeDingtalk({ clientId, clientSecret });
+        if (probe.ok !== true) {
+          setRuntime(id, 'error', `凭据不通：${probe.message}`);
+          return { ok: false, phase: 'error', message: probe.message };
+        }
+        try { dingtalkLoop?.dispose(); } catch { /* ignore */ }
+        dingtalkLoop = null;
+        setRuntime(id, 'connecting', '正在建立 Stream 长连接…');
+        const started = await startDingtalkStream({
+          clientId,
+          clientSecret,
+          onInbound: (text) => recordStatus('dingtalk-inbound-text', { text: text.slice(0, 80) }),
+          onEvent: (event, detail) => recordStatus(event, detail ?? {}),
+        });
+        if (started.ok !== true) {
+          setRuntime(id, 'error', started.message);
+          return { ok: false, phase: 'error', message: started.message };
+        }
+        dingtalkLoop = started;
+        const extra = robotCode === '' ? '' : `；RobotCode 已保存（${robotCode.slice(0, 8)}…）`;
+        setRuntime(id, 'connected', started.message + extra);
+        return { ok: true, phase: 'connected', message: started.message + extra };
+      }
+
       const result = await probeDingtalk({ clientId, clientSecret });
       // ⚠ RobotCode 在握手阶段用不上（发消息才要），但**必须读一下并反馈** ——
       //   否则界面上填了它却永远没回音，用户会以为填丢了。
-      //   （这正是"两端各写一份字符串"那类漏改：已由 diag 脚本交叉比对兜住。）
       if (result.ok === true && robotCode !== '') {
         result.message += `；RobotCode 已保存（${robotCode.slice(0, 8)}…，发消息时用）`;
         result.detail = { ...(result.detail ?? {}), hasRobotCode: true };
+      }
+      if (result.ok === true) {
+        result.message += '；⚠ 长连接组件未安装 —— 现在只能验证凭据，要在「可选组件」里装「钉钉长连接」才能收消息';
       }
       setRuntime(id, result.ok ? 'verified' : 'error', result.message, result.detail);
       return { ...result, phase: result.ok ? 'verified' : 'error' };
@@ -2674,8 +2748,13 @@ export function apply(ctx, config = {}) {
     // 留着旧连接会让下次连接把新连接顶掉（表现为"刚连上就断"）。
     try { weixinLoop?.dispose(); } catch { /* ignore */ }
     try { wecomLoop?.dispose(); } catch { /* ignore */ }
+    // 钉钉/飞书的长连接也要断 —— 尤其钉钉：它的 Stream 网关同样可能踢掉重复连接
+    try { dingtalkLoop?.dispose(); } catch { /* ignore */ }
+    try { feishuLoop?.dispose(); } catch { /* ignore */ }
     weixinLoop = null;
     wecomLoop = null;
+    dingtalkLoop = null;
+    feishuLoop = null;
     weixinLogin = null;
     if (watchdog !== null) {
       clearInterval(watchdog);

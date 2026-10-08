@@ -230,7 +230,18 @@ export async function installComponent(id, onOutput) {
 
     child.on('close', (code) => {
       clearTimeout(timer);
+      // ⚠ 不能只看退出码：pnpm 11 在"某个依赖有构建脚本但未批准"时会返回非零
+      //   （飞书 SDK 的传递依赖 protobufjs 就是这种），但**包其实已经装好了**。
+      //   判据要以"能不能真的解析到"为准，而不是"pnpm 有没有抱怨"。
       if (code !== 0) {
+        if (isInstalled(id)) {
+          resolvePromise({
+            ok: true,
+            message: `已安装（实测占用 ${formatBytes(componentBytes(id))}）。注意：pnpm 退出码 ${code}`
+              + `，通常是有传递依赖的构建脚本被跳过（例如 protobufjs）—— 包本身可用。重启客户端后生效`,
+          });
+          return;
+        }
         fail(`pnpm 退出码 ${code} —— 看上面的输出。常见原因：网络/代理不通、磁盘空间不足、registry 不可达`);
         return;
       }
@@ -238,7 +249,19 @@ export async function installComponent(id, onOutput) {
         fail('pnpm 成功了，但没找到包目录 —— 装到别处去了？看上面的输出');
         return;
       }
-      resolvePromise({ ok: true, message: `已安装（实测占用 ${formatBytes(componentBytes(id))}），重启客户端后生效` });
+      // 装的判定再加一道：真的能解析到入口
+      void (async () => {
+        try {
+          const probe = await loadComponentPackage(component.packages[0]);
+          if (probe === null) {
+            fail('包目录在，但解析不到入口 —— 安装不完整，建议卸载后重装');
+            return;
+          }
+          resolvePromise({ ok: true, message: `已安装（实测占用 ${formatBytes(componentBytes(id))}），重启客户端后生效` });
+        } catch (error) {
+          fail(`安装后自检失败：${String(error?.message ?? error)}`);
+        }
+      })();
     });
   });
 }
