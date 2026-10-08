@@ -25,7 +25,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { startStatusServer } from './control-server.js';
@@ -45,6 +45,139 @@ import { createBusyTracker } from './busy-tracker.js';
 const STATUS_DIR = process.env.DSH_HOME ?? join(homedir(), '.dsh');
 const STATUS_LOG = join(STATUS_DIR, 'im-bridge-status.log');
 const STATUS_JSON = join(STATUS_DIR, 'im-bridge-status.json');
+
+
+// ------------------------------------------------ 平台开关（哪些平台在界面上出现）
+//
+// 侧边栏的每个平台条目是**按开关动态注册 / 注销**的。依据（读源码确认，非推测）：
+//   · dsh-client-ui-slots/lib/index.js:237-242 —— register() 返回 dispose 函数
+//   · dsh-client-ui-sidebar/lib/client.js:469 —— sidebar 订阅 sidebar.panellist，
+//     条目变化时自动重排图标列表
+// 客户端读不到文件，所以这份状态必须落在宿主，再通过控制接口给界面。
+//
+// ⚠ QQ 通道**不允许关闭**：这个会话本身就跑在它上面，关掉等于把通信掐断。
+//   setPlatformEnabled 会明确拒绝，而不是静默忽略。
+const PLATFORM_IDS = ['qq', 'weixin', 'feishu', 'dingtalk', 'wecom'];
+
+const PLATFORMS_FILE = join(STATUS_DIR, 'im-bridge-platforms.json');
+
+/** 默认：QQ 开（现状），其余关（传输层还没接）。 */
+function defaultPlatforms() {
+  const value = {};
+  for (const id of PLATFORM_IDS) value[id] = id === 'qq';
+  return value;
+}
+
+/** 读平台开关；文件缺失就回默认值，文件坏了要留痕（不静默）。 */
+function loadPlatforms() {
+  const fallback = defaultPlatforms();
+  try {
+    const parsed = JSON.parse(readFileSync(PLATFORMS_FILE, 'utf8'));
+    if (parsed === null || typeof parsed !== 'object') return fallback;
+    const merged = { ...fallback };
+    for (const id of PLATFORM_IDS) {
+      if (typeof parsed[id] === 'boolean') merged[id] = parsed[id];
+    }
+    merged.qq = true;   // 永不关闭（见上面的说明）
+    return merged;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      recordStatus('platforms-read-failed', { message: String(error?.message ?? error).slice(0, 160) });
+    }
+    return fallback;
+  }
+}
+
+let platformState = defaultPlatforms();
+
+function savePlatforms() {
+  try {
+    writeFileSync(PLATFORMS_FILE, JSON.stringify(platformState, null, 2) + '\n', 'utf8');
+    return true;
+  } catch (error) {
+    recordStatus('platforms-write-failed', { message: String(error?.message ?? error).slice(0, 160) });
+    return false;
+  }
+}
+
+
+// ------------------------------------------------ 入站消息去重
+//
+// 五个平台都会重推消息：飞书要求 3 秒内处理完、超时重推；企微 / 公众号回调
+// 超时"重试三次"；微信 iLink 的长轮询游标回退也可能重复投递。
+// 而 agent 一轮要跑几十秒 —— 没有去重，同一条消息会被回答好几遍。
+//
+// 判据用**平台消息 id**（QQ 是从事件里取的 data.id）。带 TTL + 条数上限。
+// ⚠ 拿不到 id 的一律放行：宁可不防，也不能把正常消息吃掉。
+const SEEN_INBOUND_MAX = 500;
+const SEEN_INBOUND_TTL_MS = 5 * 60 * 1000;
+const seenInbound = new Map();
+
+/** @returns {boolean} true = 第一次见到（放行）；false = 重复（丢掉） */
+function rememberInbound(key) {
+  if (typeof key !== 'string' || key === '') return true;
+  const now = Date.now();
+  const previous = seenInbound.get(key);
+  if (previous !== undefined && now - previous < SEEN_INBOUND_TTL_MS) return false;
+
+  seenInbound.set(key, now);
+  if (seenInbound.size > SEEN_INBOUND_MAX) {
+    for (const [k, ts] of [...seenInbound]) {
+      if (now - ts >= SEEN_INBOUND_TTL_MS) seenInbound.delete(k);
+    }
+    while (seenInbound.size > SEEN_INBOUND_MAX) {
+      const oldest = seenInbound.keys().next();
+      if (oldest.done === true) break;
+      seenInbound.delete(oldest.value);
+    }
+  }
+  return true;
+}
+
+
+// ------------------------------------------------ 回复失败的有界重试
+//
+// 旧行为：发送失败只记一条 `reply-failed` 日志，**消息就永久丢了**。
+// 而"连接刚好在断线重连的窗口里"是最常见的失败原因 —— 等一下就能成功。
+//
+// ⚠ 关键设计：重试**不占队列表忙位**。第一发失败就立刻解忙、把排队消息放出去，
+//   重试在后台按 3 秒间隔继续，最长 30 秒（对照组：看门狗 45 秒解封）。
+//   否则一次网络抖动会把整条队列按在这里 30 秒，手机那头看起来像卡死。
+const REPLY_RETRY_INTERVAL_MS = 3000;
+const REPLY_RETRY_TOTAL_MS = 30_000;
+const replyRetryTimers = new Set();
+
+/**
+ * @param {() => Promise<unknown>} send 真正执行发送的闭包（每次重试都调用它）
+ * @param {object} context 写进状态日志的上下文（bytes / platform 等）
+ */
+function scheduleReplyRetry(send, context) {
+  const startedAt = Date.now();
+  let attempts = 0;
+  const timer = setInterval(() => {
+    attempts += 1;
+    void (async () => {
+      try {
+        await send();
+        clearInterval(timer);
+        replyRetryTimers.delete(timer);
+        recordStatus('reply-retry-ok', { ...context, attempts, afterMs: Date.now() - startedAt });
+      } catch (error) {
+        if (Date.now() - startedAt >= REPLY_RETRY_TOTAL_MS) {
+          clearInterval(timer);
+          replyRetryTimers.delete(timer);
+          recordStatus('reply-failed-final', {
+            ...context,
+            attempts,
+            waitedMs: Date.now() - startedAt,
+            message: String(error?.message ?? error).slice(0, 200),
+          });
+        }
+      }
+    })();
+  }, REPLY_RETRY_INTERVAL_MS);
+  replyRetryTimers.add(timer);
+}
 
 function recordStatus(event, detail = {}) {
   const entry = { time: new Date().toISOString(), event, ...detail };
@@ -635,6 +768,35 @@ export function apply(ctx, config = {}) {
   // 正在累积的回答：sessionId → { text, reasoning, openid, msgId }
   const pending = new Map();
 
+  // ---- 平台开关：真相在宿主，界面通过控制接口读（见 control-server 的 /platforms）
+  //
+  // 启动读一次盘；之后由设置页的开关通过 POST /im-bridge/platform 改。
+  // ⚠ 改完**不需要重启**：客户端每 5 秒拉一次，据此注册 / 注销侧边栏条目。
+  platformState = loadPlatforms();
+  recordStatus('platforms-loaded', { platforms: platformState });
+
+  /** 给客户端读（控制接口用）；ids 一并给出去，界面不用自己维护平台清单 */
+  function getPlatformsInfo() {
+    return { ok: true, platforms: { ...platformState }, ids: [...PLATFORM_IDS] };
+  }
+
+  /**
+   * 给设置页写。返回 { ok, platforms } 或 { ok:false, error }。
+   *
+   * ⚠ QQ 不允许关闭 —— 这个会话就跑在它上面，关掉等于把通信掐断。
+   *   明确报错而不是静默忽略：静默忽略会让用户以为关掉了。
+   */
+  async function setPlatformEnabled(id, enabled) {
+    if (!PLATFORM_IDS.includes(id)) return { ok: false, error: `未知平台：${String(id)}` };
+    if (id === 'qq' && enabled === false) {
+      return { ok: false, error: 'QQ 通道不能关闭：当前会话就跑在它上面' };
+    }
+    platformState = { ...platformState, [id]: enabled === true, qq: true };
+    const saved = savePlatforms();
+    recordStatus('platform-set', { id, enabled: enabled === true, saved });
+    return { ok: true, saved, platforms: { ...platformState } };
+  }
+
   // ---- 驱动问题（踩过的大坑）：
   // DSH 里"驱动 agent 跑 turn"的是 GUI 会话那条链路。插件自己用
   // ctx.agents.resume()/create() 弄出来的 agent 没有驱动 —— 消息能进收件箱
@@ -913,6 +1075,12 @@ export function apply(ctx, config = {}) {
         const openid = data.author?.user_openid;
         recordStatus('c2c-message', { openid: openid ?? null, text: text.slice(0, 80) });
         if (openid === undefined || text === '') return;
+
+        // 去重：同一条消息被平台重推时只处理一次（判据是平台消息 id）
+        if (!rememberInbound(typeof data.id === 'string' ? `qq:${data.id}` : '')) {
+          recordStatus('dedup-dropped', { platform: 'qq', messageId: String(data.id ?? '').slice(0, 48) });
+          return;
+        }
 
         // ⚠ 必须用「非空字符串才算数」的判断，不能用 ?? ——
         // Config schema 把 sessionId 默认成 ''，而 '' 不是 null/undefined，
@@ -1997,19 +2165,28 @@ export function apply(ctx, config = {}) {
       return;
     }
 
-    qq?.reply(slot.openid, reply, slot.msgId, (event, detail) => {
-      // 记下 QQ 返回的 message id / 时间戳 —— 出问题时能拿它们去 QQ 侧查，
-      // 只记字节数是不够的（"发出去了但收不到"就是这么漏掉的）
-      recordStatus(event, detail);
-    })
+    // 发送闭包 —— 首次尝试与后台重试走**同一个**它，保证两条路完全一致
+    const sendReply = () => {
+      if (qq === null) throw new Error('连接已释放（qq 为 null）');
+      return qq.reply(slot.openid, reply, slot.msgId, (event, detail) => {
+        // 记下 QQ 返回的 message id / 时间戳 —— 出问题时能拿它们去 QQ 侧查，
+        // 只记字节数是不够的（"发出去了但收不到"就是这么漏掉的）
+        recordStatus(event, detail);
+      });
+    };
+
+    sendReply()
       .then(() => {
         log(`已回复（${reply.length} 字符）`);
         recordStatus('replied', { bytes: reply.length });
         writeStatusSnapshot({ phase: 'connected', lastReplyBytes: reply.length });
       })
       .catch((error) => {
-        log(`回复失败：${error.message}`);
+        log(`回复失败：${error.message} —— 转入后台重试（最长 ${REPLY_RETRY_TOTAL_MS / 1000} 秒）`);
         recordStatus('reply-failed', { message: error.message });
+        // ⚠ 这里**不 await**：重试在后台跑，下面 finally 里的解忙 / 泵队列
+        //   照常立刻执行。否则一次网络抖动会把整条队列按死 30 秒。
+        scheduleReplyRetry(sendReply, { bytes: reply.length, openid: String(slot.openid).slice(0, 12) });
       })
       .finally(() => {
         // ⚠ 先解忙、再泵队列 —— 顺序不能反。
@@ -2132,6 +2309,9 @@ export function apply(ctx, config = {}) {
       setModel: setPanelModel,
       // 设置页用：凭据的只读状态（不含 secret）
       getCredential: getCredentialInfo,
+      // 侧边栏用：哪些平台启用 —— 界面据此**动态注册 / 注销**图标条目
+      getPlatforms: getPlatformsInfo,
+      setPlatform: setPlatformEnabled,
     });
   } catch (error) {
     recordStatus('status-server-start-failed', { message: String(error?.message ?? error) });
@@ -2149,6 +2329,11 @@ export function apply(ctx, config = {}) {
     pending.clear();
     bindings.clear();
     queues.clear();
+    // 入站去重表 + 回复重试定时器也要清 —— 否则插件重载后会留着旧定时器，
+    // 它们拿着**上一代**的 qq 引用去发消息（那个连接已经 dispose 了）。
+    seenInbound.clear();
+    for (const timer of replyRetryTimers) clearInterval(timer);
+    replyRetryTimers.clear();
     // ⚠ 不要在这里 busy.clear() —— busy 现在是个 busy-tracker 实例，
     //   它没有 clear() 方法（旧的内联 Map 才有）。写错会在这里抛错，
     //   而且抛错的位置是"卸载路径"，最难被发现。

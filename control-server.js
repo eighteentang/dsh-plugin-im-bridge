@@ -21,11 +21,25 @@
 
 import { createServer } from 'node:http';
 import { openSync, readSync, fstatSync, closeSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 export const CONTROL_PORT = 8799;
 
-/** 状态日志路径（插件把关键节点写在这里，见 index.js 的 recordStatus） */
-const STATUS_FILE = 'C:\\Users\\10454\\.dsh\\im-bridge-status.log';
+/**
+ * 状态日志路径（插件把关键节点写在这里，见 index.js 的 recordStatus）
+ *
+ * ⚠ 2026-10-08 修：这里曾经**写死开发机的绝对路径**
+ *   （`C:\Users\<开发机用户名>\.dsh\im-bridge-status.log`）。这份文件是随包发布的 ——
+ *   别人装上以后，状态面板读的是一个**他们机器上根本不存在的文件**，
+ *   界面永远显示空/异常，而日志本身其实是正常的。
+ *
+ *   同类问题 v1.1.0 修过 cordis.patch.yml 里那个 `workspace: 'D:\EasyDSH'`，
+ *   但漏了这一处。现在与 index.js 的 STATUS_DIR 用**同一套解析**：
+ *   `$DSH_HOME` → `~/.dsh`。别再各写一份。
+ */
+const STATUS_DIR = process.env.DSH_HOME ?? join(homedir(), '.dsh');
+const STATUS_FILE = join(STATUS_DIR, 'im-bridge-status.log');
 
 /**
  * 把状态日志**摘要**成界面能直接显示的结构。
@@ -124,7 +138,7 @@ export function readStatusSnapshot() {
  * @param {(msg: string) => void} options.log
  * @returns {{ dispose: () => void, port: number }}
  */
-export function startStatusServer({ log, getMessages, sendToAgent, listModels, setModel, getCredential }) {
+export function startStatusServer({ log, getMessages, sendToAgent, listModels, setModel, getCredential, getPlatforms, setPlatform }) {
   const server = createServer((req, res) => {
     const remote = req.socket.remoteAddress ?? '';
     const origin = String(req.headers.origin ?? '');
@@ -244,6 +258,45 @@ export function startStatusServer({ log, getMessages, sendToAgent, listModels, s
             const result = await setModel?.(String(parsed.provider ?? ''), String(parsed.model ?? ''));
             res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify(result ?? { ok: false, error: '没有 setModel 处理函数' }));
+          } catch (error) {
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: String(error?.message ?? error) }));
+          }
+        });
+      })();
+      return;
+    }
+
+    // ── 侧边栏：平台开关状态（哪些平台在界面上出现）──
+    //
+    // 为什么真相在宿主：客户端读不到文件，而"哪些平台启用"是要持久化的状态。
+    // 客户端每 5 秒拉一次，据此**动态注册 / 注销**侧边栏条目 ——
+    // sidebar.panellist 的 register() 返回 dispose，sidebar 会跟着重排（已核源码）。
+    if (url.pathname === '/im-bridge/platforms' && req.method === 'GET') {
+      void (async () => {
+        try {
+          const payload = await getPlatforms?.();
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(payload ?? { ok: false, platforms: {} }));
+        } catch (error) {
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, platforms: {}, error: String(error?.message ?? error) }));
+        }
+      })();
+      return;
+    }
+
+    // ── 设置页：开 / 关某个平台 ──
+    if (url.pathname === '/im-bridge/platform' && req.method === 'POST') {
+      void (async () => {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; if (body.length > 16 * 1024) req.destroy(); });
+        req.on('end', async () => {
+          try {
+            const parsed = JSON.parse(body === '' ? '{}' : body);
+            const result = await setPlatform?.(String(parsed.id ?? ''), parsed.enabled === true);
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(result ?? { ok: false, error: '没有 setPlatform 处理函数' }));
           } catch (error) {
             res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: false, error: String(error?.message ?? error) }));

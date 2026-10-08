@@ -431,6 +431,87 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'qqb-status-panel' }, ...rows);
     }
 
+    // ---------------------------------------------------------------- 平台开关
+    //
+    // "哪些平台在侧边栏出现"的真相在**宿主**：`$DSH_HOME/im-bridge-platforms.json`。
+    // 客户端读不到文件，所以走控制接口：
+    //   GET  /im-bridge/platforms  → { platforms: { qq:true, weixin:false, … } }
+    //   POST /im-bridge/platform   { id, enabled }
+    //
+    // ⚠ 切开关**不需要重启**：apply() 那边的注入回调每 5 秒拉一次，据此
+    //   注册 / 注销 sidebar.panellist 与 main 的条目。
+    //
+    // ⚠ QQ 不给关：这个会话本身就跑在它上面。宿主侧也会再拒一次 ——
+    //   界面拦是为了不让用户白点，宿主拦是因为界面只是客户端代码。
+    function PlatformToggles() {
+      ensureStyle();
+      const [state, setState] = React.useState(null);
+      const [note, setNote] = React.useState('');
+
+      const load = React.useCallback(async () => {
+        try {
+          const r = await fetch(`${CONTROL_BASE}/platforms`);
+          setState(await r.json());
+        } catch (error) {
+          setState({ ok: false, platforms: {}, error: String(error?.message ?? error) });
+        }
+      }, []);
+
+      React.useEffect(() => {
+        void load();
+        const timer = setInterval(() => { void load(); }, 5000);
+        return () => clearInterval(timer);
+      }, [load]);
+
+      const toggle = async (id, enabled) => {
+        setNote('');
+        try {
+          const r = await fetch(`${CONTROL_BASE}/platform`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id, enabled }),
+          });
+          const json = await r.json();
+          if (json?.ok === false) setNote(String(json.error ?? '切换失败'));
+          else setState((prev) => ({ ...(prev ?? {}), platforms: json.platforms ?? {} }));
+        } catch (error) {
+          setNote('切不了：连不上插件');
+        }
+      };
+
+      const platforms = state?.platforms ?? null;
+
+      return h('div', { className: 'qqb-row' },
+        h('label', null, '平台（决定左侧边栏出现哪几个入口）'),
+        platforms === null
+          ? h('div', { className: 'qqb-note' }, '正在读取平台开关…')
+          : h('div', null, PLATFORMS.map((meta) => {
+              const on = platforms[meta.id] === true;
+              const locked = meta.id === 'qq';
+              return h('div', {
+                key: meta.id,
+                style: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' },
+              },
+              h('span', { style: { width: 18, height: 18, flex: '0 0 auto', opacity: on ? 1 : 0.35 } },
+                h(meta.art, { size: 18 })),
+              h('span', { style: { flex: '1 1 auto' } }, meta.title),
+              h('span', { style: { fontSize: 11, opacity: 0.6, marginRight: 6 } },
+                meta.live === true ? '传输层已实现' : '传输层未接入'),
+              h('button', {
+                className: 'qqb-btn qqb-btn-ghost',
+                type: 'button',
+                disabled: locked,
+                title: locked
+                  ? 'QQ 通道不能关闭：当前会话就跑在它上面'
+                  : (on ? '点击关闭，侧边栏入口会消失' : '点击开启，侧边栏会出现入口'),
+                onClick: () => { void toggle(meta.id, !on); },
+              }, locked ? '常开' : (on ? '已开启' : '已关闭')));
+            })),
+        note === '' ? null : h('div', { className: 'qqb-status err' }, note),
+        h('div', { className: 'qqb-hint' },
+          '开启后对应平台会出现在左侧边栏；传输层还没实现的平台先给界面占位，点进去能看到说明。'));
+    }
+
     /** 设置页：连接 QQ */
     function QqBridgeSettings() {
       ensureStyle();
@@ -580,6 +661,8 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'qqb-wrap' },
         // ① 状态放最上面 —— 打开设置第一眼就知道"能用了没有"
         h(StatusPanel, null),
+        // ①′ 平台开关 —— 决定左侧边栏出现哪几个入口（不需要重启）
+        h(PlatformToggles, null),
         // ② 凭据区：**以宿主为准**（不再把空输入框当"没配"）
         credentialSection(),
         status === null ? null : h('div', {
@@ -622,6 +705,119 @@ window.__ModuleLoader__.load({
       h('ellipse', { cx: 8.6, cy: 24.5, rx: 2.4, ry: 3.4, fill: '#F2A03D' }),
       h('ellipse', { cx: 23.4, cy: 24.5, rx: 2.4, ry: 3.4, fill: '#F2A03D' }));
     }
+
+    // ---------------------------------------------------------------- 各平台图形
+    //
+    // 和 PenguinArt 同一套做法：内联 SVG、viewBox 固定 32x32、靠 width/height 缩放。
+    // **不用图片文件、不引依赖、不 import 任何 DSH 包** —— 纯 JS 画，
+    // 这样在 16px 的侧边栏图标和 96px 的空状态插画里都不会走样。
+    //
+    // ⚠ 刻意**不追求和官方 logo 一模一样**（用户原话："也不要很准，和奇怪的企鹅类似即可"）。
+    //   用平台主色 + 可辨认的几何形状即可，同时也避开了品牌素材的授权问题。
+
+    /** 微信「绿泡泡」：一大一小两个气泡 + 两点眼睛。 */
+    function WeixinArt(props) {
+      const size = typeof props?.size === 'number' && props.size > 0 ? props.size : 28;
+      return h('svg', {
+        viewBox: '0 0 32 32', width: size, height: size, 'aria-hidden': 'true',
+        style: { display: 'block' },
+      },
+      h('ellipse', { cx: 12.6, cy: 13.4, rx: 10.6, ry: 8.8, fill: '#07C160' }),
+      h('circle', { cx: 9.2, cy: 11.8, r: 1.5, fill: '#FFFFFF' }),
+      h('circle', { cx: 15.8, cy: 11.8, r: 1.5, fill: '#FFFFFF' }),
+      // 小白边把两个气泡分开 —— 否则同色叠在一起会糊成一团
+      h('ellipse', { cx: 20.6, cy: 21.4, rx: 8.6, ry: 7.4, fill: '#FFFFFF' }),
+      h('ellipse', { cx: 20.6, cy: 21.4, rx: 7.4, ry: 6.3, fill: '#07C160' }),
+      h('circle', { cx: 18.2, cy: 20.2, r: 1.2, fill: '#FFFFFF' }),
+      h('circle', { cx: 23.0, cy: 20.2, r: 1.2, fill: '#FFFFFF' }));
+    }
+
+    /** 飞书 Bot：折纸风的鸟 —— 一片圆弧主体 + 一道白色折线。 */
+    function FeishuArt(props) {
+      const size = typeof props?.size === 'number' && props.size > 0 ? props.size : 28;
+      return h('svg', {
+        viewBox: '0 0 32 32', width: size, height: size, 'aria-hidden': 'true',
+        style: { display: 'block' },
+      },
+      h('path', { d: 'M6.5 25.5 C6.5 14 14 6.5 25.5 6.5 C25.5 18 18 25.5 6.5 25.5 Z', fill: '#3370FF' }),
+      h('path', { d: 'M10.5 21.5 L21.5 10.5', stroke: '#FFFFFF', strokeWidth: 2.2, strokeLinecap: 'round', fill: 'none' }),
+      h('path', { d: 'M21.5 10.5 L21.5 16.5', stroke: '#FFFFFF', strokeWidth: 1.6, strokeLinecap: 'round', fill: 'none' }),
+      h('path', { d: 'M10.5 21.5 L16.5 21.5', stroke: '#FFFFFF', strokeWidth: 1.6, strokeLinecap: 'round', fill: 'none' }));
+    }
+
+    /** 钉钉 Bot：一只翅膀 + 白色闪电折线。 */
+    function DingtalkArt(props) {
+      const size = typeof props?.size === 'number' && props.size > 0 ? props.size : 28;
+      return h('svg', {
+        viewBox: '0 0 32 32', width: size, height: size, 'aria-hidden': 'true',
+        style: { display: 'block' },
+      },
+      h('path', { d: 'M5.5 19.5 C11 7.5 22.5 4.5 27 6.5 C22 9.5 18.5 13.5 16.5 20.5 L11.5 15.5 Z', fill: '#3296FA' }),
+      h('path', { d: 'M11 27 L17 17.5 L14.5 16.5 L21 9.5 L16 19 L18.5 20 Z', fill: '#FFFFFF' }),
+      h('path', { d: 'M16.5 20.5 L11.5 15.5', stroke: '#FFFFFF', strokeWidth: 1.4, strokeLinecap: 'round', fill: 'none' }));
+    }
+
+    /** 企业微信：蓝色圆角气泡 + 两点 + 一条小尾巴。 */
+    function WecomArt(props) {
+      const size = typeof props?.size === 'number' && props.size > 0 ? props.size : 28;
+      return h('svg', {
+        viewBox: '0 0 32 32', width: size, height: size, 'aria-hidden': 'true',
+        style: { display: 'block' },
+      },
+      h('rect', { x: 4, y: 6.5, width: 24, height: 18.5, rx: 5.5, fill: '#2F7DFF' }),
+      h('path', { d: 'M12 25 L12 30 L18.5 25 Z', fill: '#2F7DFF' }),
+      h('circle', { cx: 11.8, cy: 15.8, r: 2.0, fill: '#FFFFFF' }),
+      h('circle', { cx: 20.2, cy: 15.8, r: 2.0, fill: '#FFFFFF' }));
+    }
+
+    /**
+     * 平台表 —— 侧边栏条目、面板、设置页开关**共用这一份**，别各写一份。
+     *
+     *   id        —— 平台标识（与宿主 PLATFORM_IDS 对应）
+     *   panelId   —— sidebar.panellist 的 id，同时是 main 的 key（两者必须一致）
+     *   title     —— 侧边栏与面板标题
+     *   order     —— 侧边栏顺序（企鹅 20，其余依次往后）
+     *   art       —— 上面那些图形组件
+     *   live      —— **传输层是否已实现**。只有 QQ 是 true。
+     *                其余为 false：面板照常显示（格式一致），但会明确写"传输层未接入"，
+     *                并且**不轮询 QQ 的会话数据**（那会把企鹅的消息错显示到别的平台下）。
+     *   empty     —— 空状态与未接入状态的文案
+     *   accent    —— 头部小圆点的品牌色
+     */
+    const PLATFORMS = [
+      {
+        id: 'qq', panelId: 'qq-panel', title: '奇怪的企鹅', order: 20, art: PenguinArt, live: true,
+        accent: '#2B2F38',
+        emptyTitle: '这里是企鹅的窝',
+        emptyDesc: '在手机 QQ 上给它发消息，它会在这台电脑上干活；也可以直接在下面输入 —— 两条路走的是同一个大脑。',
+      },
+      {
+        id: 'weixin', panelId: 'weixin-panel', title: '微信绿泡泡', order: 21, art: WeixinArt, live: false,
+        accent: '#07C160',
+        emptyTitle: '绿泡泡还没接上',
+        emptyDesc: '微信（个人号）走的是官方 iLink / ClawBot 通道：扫码换 bot_token，再用长轮询收消息 —— 免公网、不需要 SDK。传输层还没实现，先把界面和开关放上。',
+      },
+      {
+        id: 'feishu', panelId: 'feishu-panel', title: '飞书Bot', order: 22, art: FeishuArt, live: false,
+        accent: '#3370FF',
+        emptyTitle: '飞书还没接上',
+        emptyDesc: '飞书用官方「长连接」收事件，免公网；收发在同一个 SDK 里，是实现成本最低的一家。传输层还没实现，先把界面和开关放上。',
+      },
+      {
+        id: 'dingtalk', panelId: 'dingtalk-panel', title: '钉钉Bot', order: 23, art: DingtalkArt, live: false,
+        accent: '#3296FA',
+        emptyTitle: '钉钉还没接上',
+        emptyDesc: '钉钉用官方 Stream 模式收消息，免公网；但 Stream 通道**不能回复**，发送要另走 REST 接口。传输层还没实现，先把界面和开关放上。',
+      },
+      {
+        id: 'wecom', panelId: 'wecom-panel', title: '企业微信', order: 24, art: WecomArt, live: false,
+        accent: '#2F7DFF',
+        emptyTitle: '企业微信还没接上',
+        emptyDesc: '企业微信智能机器人有官方长连接（wss://openws.work.weixin.qq.com），免公网，但**只能服务企业内部成员**。传输层还没实现，先把界面和开关放上。',
+      },
+    ];
+
+    const PLATFORM_BY_ID = new Map(PLATFORMS.map((p) => [p.id, p]));
 
     /**
      * 侧边栏入口的"在线"广播通道。
@@ -696,6 +892,36 @@ window.__ModuleLoader__.load({
       },
       h(PenguinArt, { size: Math.round(size * 0.78) }),
       online ? h('span', { className: 'qqb-badge-dot', 'aria-hidden': 'true' }) : null);
+    }
+
+    /**
+     * 通用平台图标 —— 每个平台一个实例：`makePlatformIcon(meta)`。
+     *
+     * 刻意复用企鹅那套 class（`qqb-penguin` / `qqb-badge-dot`），所以尺寸、
+     * 悬停、选中加深、在线角标的行为**完全一致**，只是图形和提示文字换成各自的。
+     *
+     * ⚠ 在线角标只在 `meta.live` 为真时才可能亮 —— 没接传输层的平台画一个
+     *   "在线"点等于骗人（界面上任何"结论"都必须是真的）。
+     */
+    function makePlatformIcon(meta) {
+      const Art = meta.art;
+      return function PlatformIcon(props) {
+        ensureStyle();
+        const size = typeof props?.size === 'number' && props.size > 0 ? props.size : 28;
+        const active = props?.active === true;
+        const online = meta.live === true && useLinkUp();
+
+        return h('div', {
+          className: active ? 'qqb-penguin qqb-penguin-active' : 'qqb-penguin',
+          style: { width: size, height: size, position: 'relative' },
+          title: meta.live === true
+            ? (online ? `${meta.title}（在线）` : `${meta.title}（未连通）`)
+            : `${meta.title}（传输层未接入）`,
+          'aria-label': meta.title,
+        },
+        h(Art, { size: Math.round(size * 0.78) }),
+        online ? h('span', { className: 'qqb-badge-dot', 'aria-hidden': 'true' }) : null);
+      };
     }
 
     /**
@@ -916,6 +1142,67 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 通用平台面板 —— 给「传输层还没接」的平台用。
+     *
+     * 刻意和企鹅面板**同一套 DOM 结构与 class**（qqb-panel / qqb-panel-head /
+     * qqb-panel-body / qqb-body-inner / qqb-panel-foot …），所以点进去看起来
+     * 是同一个产品，只有图形和文案换成各自平台。
+     *
+     * ⚠ 它**不轮询 `/messages`** —— 那个接口返回的是 **QQ 专用会话**的数据，
+     *   显示到这里就等于把企鹅的消息挂到别的平台名下。等各平台传输层接好，
+     *   再把 `meta.live` 打开、接上真实的会话路由。
+     */
+    function makePlatformPanel(meta) {
+      const Art = meta.art;
+      return function PlatformPanel() {
+        ensureStyle();
+
+        const head = h('div', { className: 'qqb-panel-head' },
+          h('div', { className: 'qqb-head-avatar' }, h(Art, { size: 28 })),
+          h('div', { className: 'qqb-head-text' },
+            h('div', { className: 'qqb-panel-title-row' },
+              h('div', { className: 'qqb-panel-title' }, meta.title)),
+            h('div', { className: 'qqb-panel-sub' }, '传输层未接入 —— 界面已就绪')),
+          h('div', { className: 'qqb-panel-spacer' }),
+          h('span', { className: 'qqb-badge' }, '未接入'));
+
+        const body = h('div', { className: 'qqb-panel-body' },
+          h('div', { className: 'qqb-body-inner' },
+          h('div', { className: 'qqb-panel-empty' },
+            h('div', { className: 'qqb-empty-art' }, h(Art, { size: 96 })),
+            h('div', { className: 'qqb-empty-title' }, meta.emptyTitle),
+            h('div', { className: 'qqb-empty-desc' }, meta.emptyDesc),
+            h('div', { className: 'qqb-empty-hint' },
+              '在「设置 → 连接 IM」里可以开关这个平台；传输层接好之后，这块就是它的会话界面。'))));
+
+        const foot = h('div', { className: 'qqb-panel-foot' },
+          h('div', { className: 'qqb-foot-inner' },
+          h('div', { className: 'qqb-send-row' },
+            h('textarea', {
+              className: 'qqb-send-box',
+              value: '',
+              placeholder: '传输层未接入，暂时发不出去',
+              disabled: true,
+              readOnly: true,
+              rows: 1,
+            }),
+            h('button', {
+              className: 'qqb-send-btn',
+              type: 'button',
+              disabled: true,
+              title: '传输层未接入',
+              'aria-label': '发送',
+            }, h(SendIcon, { size: 16 }))),
+          h('div', { className: 'qqb-panel-note' },
+            h('span', null, meta.title),
+            h('span', null, '·'),
+            h('span', null, '仅界面占位'))));
+
+        return h('div', { className: 'qqb-panel' }, head, body, foot);
+      };
+    }
+
+    /**
      * 发送图标 —— 一个简笔纸飞机，和 DSH 原生发送按钮一样是"圆形图标按钮"。
      *
      * 为什么不写"发送"两个字：DSH 原生的提交按钮是个 34x34 的圆形图标按钮
@@ -1080,17 +1367,96 @@ window.__ModuleLoader__.load({
         // 为什么放在 QQ 插件里而不是单独一个插件：
         //   入口和功能应该同生共死 —— 禁用 QQ 插件时图标和面板一起消失，
         //   不会出现"插件没了但图标还在、点了是空白"。
-        ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
-          name: 'sidebar.panellist',
-          id: 'qq-panel',
-          order: 20,
-          label: () => '奇怪的企鹅',
-        }, PenguinIcon));
+        // ── 通用：把"宿主说启用了哪几个平台"变成动态的槽位条目 ──────────
+        //
+        // 依据（读源码确认，非推测）：
+        //   · dsh-client-ui-slots/lib/index.js:237-242 —— register() **返回 dispose**
+        //   · dsh-client-ui-sidebar/lib/client.js:469 —— sidebar 订阅 sidebar.panellist，
+        //     条目变化时自动重排图标列表
+        // ⚠ 不要用"图标组件 return null"来隐藏：那样**行还在**，
+        //   会留下一个空图标 + 文字的按钮。必须真注册 / 真注销。
+        const wireDynamicPlatforms = (makeOptions, makeComponent) => {
+          const disposers = new Map();   // 平台 id → dispose
+          let stopped = false;
 
-        ctx.slots.inject('main', () => ctx.slots.register({
-          name: 'main',
-          key: 'qq-panel',
-        }, QqPanel));
+          const sync = (enabled) => {
+            for (const meta of PLATFORMS) {
+              if (meta.id === 'qq') continue;          // 企鹅已静态注册
+              const on = enabled[meta.id] === true;
+              const has = disposers.has(meta.id);
+              if (on && !has) {
+                try {
+                  disposers.set(meta.id, ctx.slots.register(makeOptions(meta), makeComponent(meta)));
+                } catch (error) {
+                  console.error('[im-bridge] 注册平台入口失败：' + String(meta.id), error);
+                }
+              } else if (!on && has) {
+                try { disposers.get(meta.id)(); } catch { /* ignore */ }
+                disposers.delete(meta.id);
+              }
+            }
+          };
+
+          const poll = async () => {
+            if (stopped) return;
+            try {
+              const response = await fetch(`${CONTROL_BASE}/platforms`);
+              const json = await response.json();
+              if (!stopped) sync(json?.platforms ?? {});
+            } catch {
+              // 接口没响应（插件没起 / 正忙）时**不动已有条目** ——
+              // 宁可维持现状，也不要因为一次探测失败把图标全清掉。
+            }
+          };
+
+          void poll();
+          const timer = setInterval(() => { void poll(); }, 5000);
+
+          return () => {
+            stopped = true;
+            clearInterval(timer);
+            for (const dispose of disposers.values()) {
+              try { dispose(); } catch { /* ignore */ }
+            }
+            disposers.clear();
+          };
+        };
+
+        // ── 侧边栏入口 + 主区域面板 ─────────────────────────────────────
+        //
+        // 这两个槽位是配对的（DSH 原话）：
+        //   "Global panel icons. Each list id addresses the matching main panel"
+        // 所以 sidebar.panellist 的 id 必须和 main 的 key **一致**（都用 <平台>-panel）。
+        //
+        // 企鹅（QQ）**静态注册**：它是唯一已实现的传输层，必须一直在。
+        //   入口和功能同生共死 —— 禁用插件时图标和面板一起消失，
+        //   不会出现"插件没了但图标还在、点了是空白"。
+        // 其余四个平台**动态注册**：开关状态在宿主（设置页改），这边每 5 秒对齐一次。
+        ctx.slots.inject('sidebar.panellist', () => {
+          const disposeQq = ctx.slots.register({
+            name: 'sidebar.panellist',
+            id: 'qq-panel',
+            order: 20,
+            label: () => '奇怪的企鹅',
+          }, PenguinIcon);
+          const disposeOthers = wireDynamicPlatforms(
+            (meta) => ({ name: 'sidebar.panellist', id: meta.panelId, order: meta.order, label: () => meta.title }),
+            (meta) => makePlatformIcon(meta),
+          );
+          return () => { disposeOthers(); disposeQq(); };
+        });
+
+        ctx.slots.inject('main', () => {
+          const disposeQq = ctx.slots.register({
+            name: 'main',
+            key: 'qq-panel',
+          }, QqPanel);
+          const disposeOthers = wireDynamicPlatforms(
+            (meta) => ({ name: 'main', key: meta.panelId }),
+            (meta) => makePlatformPanel(meta),
+          );
+          return () => { disposeOthers(); disposeQq(); };
+        });
       },
     };
   },
