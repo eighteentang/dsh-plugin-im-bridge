@@ -1,0 +1,388 @@
+/**
+ * im-bridge · 各平台的「连接测试」实现
+ *
+ * 目标：**你点一下按钮，就能知道这个平台的凭据到底通不通。**
+ *
+ * ⚠ 全部**零依赖**：只用 Node 内置能力（`fetch` / `WebSocket` / `Buffer`）。
+ *   这不是洁癖 —— 插件是 `link:` 装进 profile 的，一旦 import 第三方包
+ *   （尤其 `@deepseek-ai/*`）就会 ERR_MODULE_NOT_FOUND（见经验库 E35）；
+ *   而且飞书官方 SDK 解包 **30MB**，会把 ~200KB 的插件变成 30MB。
+ *
+ * 各平台的能力边界（**刻意不同，不要以为都一样**）：
+ *   weixin  —— 官方 iLink / ClawBot 协议，HTTP + 长轮询。
+ *              **收 + 回都实现了**（协议细节从官方包源码核对过，非二手文章）。
+ *              连接测试 = 扫码换 token → 起长轮询；你发消息它会**回显**。
+ *   wecom   —— 官方智能机器人长连接（JSON cmd over WebSocket）。
+ *              订阅 + 心跳 + 收消息已实现；**回复帧的形状官方未公开**，
+ *              所以只报"订阅成功 + 收到过几条"，不假装能回。
+ *   feishu  —— 官方长连接要走它的私有协议（SDK 里带 protobufjs），
+ *              手写风险高。这里做 **REST 握手测试**：拿 tenant_access_token。
+ *   dingtalk—— 同上。Stream 模式官方给了 SDK；这里做 **REST 握手测试**：
+ *              拿 access_token。
+ *
+ * 所以：微信/企业微信是**真连接**，飞书/钉钉是**凭据可用性验证**。
+ * 界面上会如实这么写，不把"token 拿到了"说成"已经能收消息了"。
+ */
+
+// ---------------------------------------------------------------- 通用
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** 带超时的 fetch —— 所有网络调用都必须有超时，否则界面会一直转圈。 */
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10_000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 把未知错误变成一句人话（网络类错误 pnpm/Node 的原文对用户没意义）。 */
+function describeError(error) {
+  const message = String(error?.message ?? error);
+  if (error?.name === 'AbortError') return '请求超时';
+  if (/ENOTFOUND|EAI_AGAIN/.test(message)) return '域名解析失败（检查网络/DNS）';
+  if (/ECONNREFUSED|ECONNRESET|socket hang up/i.test(message)) return '连接被拒绝或中断';
+  if (/ETIMEDOUT/.test(message)) return '连接超时';
+  if (/certificate|TLS|SSL/i.test(message)) return 'TLS 证书校验失败（可能被代理拦截）';
+  return message.slice(0, 200);
+}
+
+// ---------------------------------------------------------------- 飞书
+
+/**
+ * 飞书：REST 握手测试。
+ *
+ * 拿到 `tenant_access_token` 就说明 **App ID / App Secret 是对的**，
+ * 这是"凭据可用性"的判据，**不等于**"长连接已就绪"。
+ * 长连接还要在开发者后台把「事件配置」切成"使用长连接接收事件"
+ * —— 而那个操作**要求保存时已有客户端在线**，是后面接传输层的事。
+ */
+export async function probeFeishu({ appId, appSecret }) {
+  if (appId === '' || appSecret === '') return { ok: false, message: '请先填 App ID 和 App Secret' };
+  try {
+    const response = await fetchWithTimeout(
+      'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+      },
+    );
+    const data = await response.json();
+    if (data.code !== 0) {
+      return { ok: false, message: `鉴权被拒：code=${data.code} ${data.msg ?? ''}`.trim() };
+    }
+    return {
+      ok: true,
+      message: `鉴权通过，tenant_access_token 已获取（${data.expire ?? '?'} 秒有效）`,
+      detail: { expire: data.expire ?? null, note: '仅验证凭据可用；长连接需在飞书后台另行开启' },
+    };
+  } catch (error) {
+    return { ok: false, message: `连不上飞书：${describeError(error)}` };
+  }
+}
+
+// ---------------------------------------------------------------- 钉钉
+
+/**
+ * 钉钉：REST 握手测试。
+ *
+ * ⚠ 官方文档说：有效期内重复获取会返回**同一个** token 并自动续期，
+ *   所以这个接口可以放心点（不会把 token 刷坏）。
+ *   但**不能高频轮询** —— 组织内所有应用合计 10000 次/自然月（标准版）。
+ */
+export async function probeDingtalk({ clientId, clientSecret }) {
+  if (clientId === '' || clientSecret === '') return { ok: false, message: '请先填 Client ID（AppKey）和 Client Secret（AppSecret）' };
+  try {
+    const url = 'https://oapi.dingtalk.com/gettoken'
+      + `?appkey=${encodeURIComponent(clientId)}`
+      + `&appsecret=${encodeURIComponent(clientSecret)}`;
+    const response = await fetchWithTimeout(url, { method: 'GET' });
+    const data = await response.json();
+    if (data.errcode !== 0) {
+      return { ok: false, message: `鉴权被拒：errcode=${data.errcode} ${data.errmsg ?? ''}`.trim() };
+    }
+    return {
+      ok: true,
+      message: `鉴权通过，access_token 已获取（${data.expires_in ?? '?'} 秒有效）`,
+      detail: { expiresIn: data.expires_in ?? null, note: '仅验证凭据可用；Stream 模式需另接 SDK' },
+    };
+  } catch (error) {
+    return { ok: false, message: `连不上钉钉：${describeError(error)}` };
+  }
+}
+
+// ---------------------------------------------------------------- 微信 iLink / ClawBot
+
+const ILINK_BASE = 'https://ilinkai.weixin.qq.com';
+
+/**
+ * `X-WECHAT-UIN`：随机 uint32 → 十进制字符串 → base64。
+ * 官方源码里每个请求都会重新生成，作用是防重放。
+ */
+function randomWechatUin() {
+  const value = Math.floor(Math.random() * 0xFFFFFFFF);
+  return Buffer.from(String(value), 'utf8').toString('base64');
+}
+
+function ilinkHeaders(token) {
+  return {
+    'content-type': 'application/json',
+    // ⚠ 这两个头名是协议规定的（注意 AuthorizationType 不是 Authorization）
+    AuthorizationType: 'ilink_bot_token',
+    'X-WECHAT-UIN': randomWechatUin(),
+    ...(typeof token === 'string' && token !== '' ? { authorization: `Bearer ${token}` } : {}),
+  };
+}
+
+/**
+ * 第一步：拿登录二维码。
+ *
+ * ⚠ **是 POST，不是 GET**，而且要带 body `{ local_token_list }`。
+ *   网上流传很广的那篇《微信 Bot API 技术解析》写成了 GET —— 那是错的，
+ *   这里依据的是官方包 `@tencent-weixin/openclaw-weixin` 的源码
+ *   （`auth/login-qr.js` 用的就是 apiPostFetch）。
+ *
+ * `local_token_list` 只是"本机以前登录过的 bot token"，**不含任何
+ * OpenClaw 账号凭据** —— 所以这个登录不依赖 OpenClaw（这点我核过源码）。
+ */
+export async function weixinStartLogin(localTokens = []) {
+  try {
+    const response = await fetchWithTimeout(
+      `${ILINK_BASE}/ilink/bot/get_bot_qrcode?bot_type=3`,
+      { method: 'POST', headers: ilinkHeaders(), body: JSON.stringify({ local_token_list: localTokens }) },
+      15_000,
+    );
+    const data = await response.json();
+    if (typeof data?.qrcode !== 'string' || data.qrcode === '') {
+      return { ok: false, message: `拿二维码失败：${JSON.stringify(data).slice(0, 200)}` };
+    }
+    return {
+      ok: true,
+      qrcode: data.qrcode,
+      // qrcode_img_content 就是二维码里编码的那个链接 —— 手机上直接打开它也能完成绑定
+      qrUrl: typeof data.qrcode_img_content === 'string' ? data.qrcode_img_content : '',
+      message: '二维码已生成，请用手机微信扫码（二维码 5 分钟内有效）',
+    };
+  } catch (error) {
+    return { ok: false, message: `连不上微信 iLink：${describeError(error)}` };
+  }
+}
+
+/** 第二步：轮询扫码状态。`confirmed` 时会带上 bot_token。 */
+export async function weixinPollLogin(qrcode) {
+  try {
+    const response = await fetchWithTimeout(
+      `${ILINK_BASE}/ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`,
+      { method: 'GET', headers: ilinkHeaders() },
+      40_000,   // 服务端会 hold 约 35 秒（长轮询）
+    );
+    return await response.json();
+  } catch (error) {
+    // 客户端超时属正常（服务端 hold 到 35 秒）；当成"继续等"
+    if (error?.name === 'AbortError') return { status: 'wait' };
+    return { status: 'error', message: describeError(error) };
+  }
+}
+
+/**
+ * 第三步：起长轮询收消息，并**回显**。
+ *
+ * 为什么先回显而不是直接接 agent：回显能一次证明**收发两个方向都通**，
+ * 而且不需要会话路由（那是下一步的事）。界面上会写明这是"测试回显"。
+ *
+ * @param {object} options
+ * @param {string} options.token   bot_token
+ * @param {(text: string) => void} options.onInbound  收到消息（用于写日志/状态）
+ * @param {(event: string, detail?: object) => void} options.onEvent
+ * @returns {{ dispose: () => void }}
+ */
+export function startWeixinLoop({ token, onInbound, onEvent }) {
+  let stopped = false;
+  let cursor = '';
+  let failures = 0;
+
+  const post = async (path, body) => {
+    const response = await fetchWithTimeout(
+      `${ILINK_BASE}/${path}`,
+      { method: 'POST', headers: ilinkHeaders(token), body: JSON.stringify(body) },
+      45_000,
+    );
+    return await response.json();
+  };
+
+  /** 回显一条文本。必须原样带上 inbound 的 context_token，否则关联不到会话。 */
+  const echo = async (message, text) => {
+    const body = {
+      msg: {
+        to_user_id: message.from_user_id,
+        message_type: 2,
+        message_state: 2,
+        context_token: message.context_token,
+        item_list: [{ type: 1, text_item: { text } }],
+      },
+    };
+    try {
+      await post('ilink/bot/sendmessage', body);
+      onEvent?.('weixin-replied', { bytes: text.length });
+    } catch (error) {
+      onEvent?.('weixin-reply-failed', { message: describeError(error) });
+    }
+  };
+
+  const loop = async () => {
+    while (!stopped) {
+      try {
+        const data = await post('ilink/bot/getupdates', {
+          get_updates_buf: cursor,
+          base_info: { channel_version: '2.4.9' },
+        });
+        failures = 0;
+        if (typeof data?.get_updates_buf === 'string' && data.get_updates_buf !== '') {
+          cursor = data.get_updates_buf;   // 游标必须更新，否则会重复收到消息
+        }
+        for (const message of (Array.isArray(data?.msgs) ? data.msgs : [])) {
+          // message_type 1 = 用户发来的；2 = 机器人自己发的（要跳过，否则自问自答）
+          if (message?.message_type !== 1) continue;
+          const text = String(message?.item_list?.[0]?.text_item?.text ?? '').trim();
+          if (text === '') continue;
+          onEvent?.('weixin-inbound', { chars: text.length });
+          onInbound?.(text);
+          await echo(message, `[测试回显] 收到：${text}`);
+        }
+      } catch (error) {
+        if (stopped) return;
+        failures += 1;
+        onEvent?.('weixin-poll-failed', { failures, message: describeError(error) });
+        // 退避：连续失败就多等一会儿，但别放弃（token 通常还是好的）
+        await sleep(Math.min(30_000, 2000 * failures));
+      }
+    }
+  };
+
+  void loop();
+
+  return {
+    dispose() {
+      stopped = true;
+    },
+  };
+}
+
+// ---------------------------------------------------------------- 企业微信（智能机器人长连接）
+
+const WECOM_WS = 'wss://openws.work.weixin.qq.com';
+
+/**
+ * 企业微信：连官方长连接 + 订阅 + 心跳。
+ *
+ * 协议（JSON cmd over WebSocket，与 QQ 的 op 码风格不同但同样简单）：
+ *   发 `{ cmd: 'aibot_subscribe', body: { bot_id, secret } }` 订阅
+ *   收 `aibot_msg_callback` / `aibot_event_callback`
+ *   发 `{ cmd: 'ping' }` 心跳（建议 30 秒）
+ *
+ * ⚠ 两个已知限制，界面上要如实说：
+ *   ① **每个机器人同时只能有一条有效连接**，新连接会把旧的踢下线。
+ *   ② **回复帧（aibot_respond_msg）的字段形状官方未公开** —— 所以这里
+ *      只保证"订阅成功 + 能收到消息"，**不假装能回复**。
+ *
+ * @returns {{ dispose: () => void }}
+ */
+export function startWecomLoop({ botId, secret, onInbound, onEvent }) {
+  let stopped = false;
+  let socket = null;
+  let pingTimer = null;
+  let retryTimer = null;
+  let attempts = 0;
+
+  const connect = () => {
+    if (stopped) return;
+    let ws;
+    try {
+      ws = new WebSocket(WECOM_WS);
+    } catch (error) {
+      onEvent?.('wecom-open-failed', { message: describeError(error) });
+      scheduleRetry();
+      return;
+    }
+    socket = ws;
+
+    ws.addEventListener('open', () => {
+      onEvent?.('wecom-ws-open', {});
+      ws.send(JSON.stringify({ cmd: 'aibot_subscribe', body: { bot_id: botId, secret } }));
+      if (pingTimer !== null) clearInterval(pingTimer);
+      pingTimer = setInterval(() => {
+        try { ws.send(JSON.stringify({ cmd: 'ping' })); } catch { /* ignore */ }
+      }, 30_000);
+    });
+
+    ws.addEventListener('message', (event) => {
+      let payload;
+      try { payload = JSON.parse(String(event.data)); } catch { return; }
+      const cmd = String(payload?.cmd ?? '');
+      const body = payload?.body ?? payload;
+
+      if (cmd === 'aibot_subscribe' || cmd === 'subscribe') {
+        const code = body?.errcode ?? payload?.errcode ?? 0;
+        if (code === 0) {
+          attempts = 0;
+          onEvent?.('wecom-subscribed', {});
+        } else {
+          onEvent?.('wecom-subscribe-rejected', {
+            errcode: code,
+            errmsg: String(body?.errmsg ?? payload?.errmsg ?? ''),
+          });
+        }
+        return;
+      }
+
+      if (cmd === 'aibot_msg_callback' || cmd === 'aibot_event_callback') {
+        const text = String(
+          body?.text?.content ?? body?.msg?.text?.content ?? body?.content ?? '',
+        ).trim();
+        const chatType = String(body?.chattype ?? body?.chat_type ?? '');
+        onEvent?.('wecom-inbound', { chatType, chars: text.length });
+        if (text !== '') onInbound?.(text);
+      }
+    });
+
+    ws.addEventListener('close', () => {
+      if (pingTimer !== null) { clearInterval(pingTimer); pingTimer = null; }
+      if (stopped) return;
+      onEvent?.('wecom-ws-closed', {});
+      scheduleRetry();
+    });
+
+    ws.addEventListener('error', () => {
+      onEvent?.('wecom-ws-error', {});
+    });
+  };
+
+  const scheduleRetry = () => {
+    if (stopped || retryTimer !== null) return;
+    attempts += 1;
+    // 被踢/断线后逐步退避；连续太多次就放弃（说明凭据或网络有问题，别无限重连）
+    if (attempts > 8) {
+      onEvent?.('wecom-give-up', { attempts });
+      return;
+    }
+    const delay = Math.min(30_000, 2000 * attempts);
+    retryTimer = setTimeout(() => { retryTimer = null; connect(); }, delay);
+  };
+
+  connect();
+
+  return {
+    dispose() {
+      stopped = true;
+      if (pingTimer !== null) clearInterval(pingTimer);
+      if (retryTimer !== null) clearTimeout(retryTimer);
+      try { socket?.close(); } catch { /* ignore */ }
+    },
+  };
+}
+
+export { describeError };

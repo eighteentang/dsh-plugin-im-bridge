@@ -447,6 +447,12 @@ window.__ModuleLoader__.load({
       ensureStyle();
       const [state, setState] = React.useState(null);
       const [note, setNote] = React.useState('');
+      // ---- 「测试连接」用的状态（2026-10-08 加）----
+      const [openId, setOpenId] = React.useState('');      // 展开的是哪个平台的凭据表单
+      const [forms, setForms] = React.useState({});        // id -> { 字段名: 值 }
+      const [busyId, setBusyId] = React.useState('');      // 正在保存/测试哪个平台
+      const [results, setResults] = React.useState({});    // id -> { kind, text }
+      const [qrUrl, setQrUrl] = React.useState('');        // 微信扫码链接
 
       const load = React.useCallback(async () => {
         try {
@@ -479,37 +485,166 @@ window.__ModuleLoader__.load({
         }
       };
 
+      // ---- 扫码轮询：只在"拿到二维码链接"时启动，拿到结果就停 ----
+      React.useEffect(() => {
+        if (qrUrl === '') return undefined;
+        const timer = setInterval(async () => {
+          try {
+            const r = await fetch(`${CONTROL_BASE}/weixin/poll`, { method: 'POST' });
+            const json = await r.json();
+            if (json?.pending === true) return;
+            setQrUrl('');
+            setResults((prev) => ({ ...prev, weixin: { kind: json?.ok === false ? 'err' : 'ok', text: String(json?.message ?? '') } }));
+            void load();
+          } catch { /* 网络抖动就等下一轮 */ }
+        }, 1500);
+        return () => clearInterval(timer);
+      }, [qrUrl, load]);
+
+      const setField = (id, key) => (event) => setForms((prev) => ({
+        ...prev,
+        [id]: { ...(prev[id] ?? {}), [key]: event.target.value },
+      }));
+
+      /** 保存凭据（若确实填了）+ 测试连接 —— 合成一个动作，用户只点一次 */
+      const saveAndTest = async (meta) => {
+        setBusyId(meta.id);
+        setResults((prev) => ({ ...prev, [meta.id]: { kind: 'note', text: '正在保存并测试…' } }));
+        try {
+          const fields = PLATFORM_FIELDS[meta.id] ?? [];
+          const env = {};
+          let filled = 0;
+          for (const field of fields) {
+            const value = String(forms[meta.id]?.[field.key] ?? '').trim();
+            if (value !== '') { env[field.key] = value; filled += 1; }
+          }
+          // ⚠ 只有用户**确实填了东西**才写凭据 —— 否则"只点测试"会把他存好的凭据覆盖成空
+          if (fields.length > 0 && filled > 0) {
+            const saved = await (await fetch(`${CONTROL_BASE}/credential`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ id: meta.id, env }),
+            })).json();
+            if (saved?.ok === false) {
+              setResults((prev) => ({ ...prev, [meta.id]: { kind: 'err', text: String(saved.message ?? '保存失败') } }));
+              return;
+            }
+          }
+          const tested = await (await fetch(`${CONTROL_BASE}/test`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id: meta.id }),
+          })).json();
+          if (tested?.needScan === true) {
+            setQrUrl(String(tested.qrUrl ?? ''));
+            setResults((prev) => ({ ...prev, [meta.id]: { kind: 'note', text: String(tested.message ?? '') } }));
+          } else {
+            setResults((prev) => ({
+              ...prev,
+              [meta.id]: { kind: tested?.ok === true ? 'ok' : 'err', text: String(tested?.message ?? '') },
+            }));
+          }
+          void load();
+        } catch (error) {
+          setResults((prev) => ({ ...prev, [meta.id]: { kind: 'err', text: '连不上插件（Host 侧没在跑？）' } }));
+        } finally {
+          setBusyId('');
+        }
+      };
+
       const platforms = state?.platforms ?? null;
 
+      /** 一行平台：开关 + 阶段 + 展开后的凭据与测试 */
+      const rowFor = (meta) => {
+        const on = platforms?.[meta.id] === true;
+        const locked = meta.id === 'qq';
+        const runtime = state?.status?.[meta.id] ?? null;
+        const phase = String(runtime?.phase ?? 'idle');
+        const result = results[meta.id] ?? null;
+        const fields = PLATFORM_FIELDS[meta.id] ?? [];
+        const expanded = openId === meta.id;
+
+        const head = h('div', {
+          key: 'head',
+          style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 0' },
+        },
+        h('span', { style: { width: 18, height: 18, flex: '0 0 auto', opacity: on ? 1 : 0.35 } },
+          h(meta.art, { size: 18 })),
+        h('span', { style: { flex: '1 1 auto' } }, meta.title),
+        h('span', {
+          style: {
+            fontSize: 11,
+            marginRight: 6,
+            color: phase === 'error' ? 'var(--dsw-alias-state-error-primary)'
+              : (phase === 'connected' || phase === 'verified') ? 'var(--dsw-alias-state-success-primary)'
+              : 'var(--dsw-alias-label-secondary)',
+          },
+          title: String(runtime?.message ?? ''),
+        }, PHASE_TEXT[phase] ?? phase),
+        h('button', {
+          className: 'qqb-btn qqb-btn-ghost',
+          type: 'button',
+          disabled: locked,
+          title: locked
+            ? 'QQ 通道不能关闭：当前会话就跑在它上面'
+            : (on ? '点击关闭，侧边栏入口会消失' : '点击开启，侧边栏会出现入口'),
+          onClick: () => { void toggle(meta.id, !on); },
+        }, locked ? '常开' : (on ? '已开启' : '已关闭')),
+        h('button', {
+          className: 'qqb-btn qqb-btn-ghost',
+          type: 'button',
+          onClick: () => setOpenId(expanded ? '' : meta.id),
+        }, expanded ? '收起' : '配置/测试'));
+
+        if (!expanded) return h('div', { key: meta.id }, head);
+
+        const detail = h('div', {
+          key: 'body',
+          style: { padding: '6px 0 10px 26px', display: 'flex', flexDirection: 'column', gap: 8 },
+        },
+        fields.length === 0
+          ? h('div', { className: 'qqb-note' },
+              meta.id === 'weixin'
+                ? '微信不用填 AppID —— 点下面的按钮会出现一个二维码链接，用手机微信扫码即可。'
+                : '这个平台不需要静态凭据。')
+          : h('div', null, fields.map((field) => h('div', { className: 'qqb-row', key: field.key },
+              h('label', null, field.label),
+              h('input', {
+                value: forms[meta.id]?.[field.key] ?? '',
+                onChange: setField(meta.id, field.key),
+                placeholder: field.placeholder ?? '',
+                type: field.secret === true ? 'password' : 'text',
+                spellCheck: false,
+              })))),
+        h('div', { className: 'qqb-actions' },
+          h('button', {
+            className: 'qqb-btn',
+            type: 'button',
+            disabled: busyId === meta.id,
+            onClick: () => { void saveAndTest(meta); },
+          }, busyId === meta.id ? '测试中…' : '保存并测试连接')),
+        result === null ? null : h('div', {
+          className: `qqb-status ${result.kind === 'ok' ? 'ok' : result.kind === 'err' ? 'err' : ''}`,
+        }, result.text),
+        String(runtime?.message ?? '') === '' ? null : h('div', { className: 'qqb-hint' },
+          `宿主状态：${String(runtime.message)}`),
+        qrUrl === '' ? null : h('div', { className: 'qqb-row' },
+          h('label', null, '扫码'),
+          h('a', { href: qrUrl, target: '_blank', rel: 'noreferrer' }, '点这里打开二维码链接'),
+          h('div', { className: 'qqb-hint' },
+            '用手机微信扫码；或者直接在手机上打开这个链接。扫完这页会自动继续（每 1.5 秒查一次）。')));
+
+        return h('div', { key: meta.id }, head, detail);
+      };
+
       return h('div', { className: 'qqb-row' },
-        h('label', null, '平台（决定左侧边栏出现哪几个入口）'),
+        h('label', null, '平台（开关决定左侧边栏出现哪几个入口；凭据与测试都在这里）'),
         platforms === null
-          ? h('div', { className: 'qqb-note' }, '正在读取平台开关…')
-          : h('div', null, PLATFORMS.map((meta) => {
-              const on = platforms[meta.id] === true;
-              const locked = meta.id === 'qq';
-              return h('div', {
-                key: meta.id,
-                style: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' },
-              },
-              h('span', { style: { width: 18, height: 18, flex: '0 0 auto', opacity: on ? 1 : 0.35 } },
-                h(meta.art, { size: 18 })),
-              h('span', { style: { flex: '1 1 auto' } }, meta.title),
-              h('span', { style: { fontSize: 11, opacity: 0.6, marginRight: 6 } },
-                meta.live === true ? '传输层已实现' : '传输层未接入'),
-              h('button', {
-                className: 'qqb-btn qqb-btn-ghost',
-                type: 'button',
-                disabled: locked,
-                title: locked
-                  ? 'QQ 通道不能关闭：当前会话就跑在它上面'
-                  : (on ? '点击关闭，侧边栏入口会消失' : '点击开启，侧边栏会出现入口'),
-                onClick: () => { void toggle(meta.id, !on); },
-              }, locked ? '常开' : (on ? '已开启' : '已关闭')));
-            })),
+          ? h('div', { className: 'qqb-note' }, '正在读取平台状态…')
+          : h('div', null, PLATFORMS.map((meta) => rowFor(meta))),
         note === '' ? null : h('div', { className: 'qqb-status err' }, note),
         h('div', { className: 'qqb-hint' },
-          '开启后对应平台会出现在左侧边栏；传输层还没实现的平台先给界面占位，点进去能看到说明。'));
+          '⚠ 四个平台的能力不同：微信 / 企业微信是**真连接**；飞书 / 钉钉目前只验证**凭据可用**（长连接还需接传输层）。'));
     }
 
     /** 设置页：连接 QQ */
@@ -623,18 +758,24 @@ window.__ModuleLoader__.load({
           // 写进 Host 的凭据存储：记录形如
           //   { kind: 'api-key', env: { QQ_BOT_APPID, QQ_BOT_SECRET } }
           // Host 侧插件监听 'credentials/record-updated'，收到就自动重连。
+          // ⚠ 这里原来走 `ctx?.remote?.credentials` —— **那是坏的**（已确认）：
+          //   `factory(require)` 里没有绑定 `ctx`，而对**未声明**的标识符，
+          //   可选链 `ctx?.x` 照样抛 ReferenceError，又被 catch 吞掉。
+          //   结果：点「连接 QQ」永远提示"没写进 Host 凭据存储"，静默失败。
+          //   现在改成让宿主写（POST /credential），宿主写完会**回读确认**。
           let written = false;
+          let saveError = '';
           try {
-            const remote = ctx?.remote?.credentials;
-            if (remote !== undefined && typeof remote.set === 'function') {
-              const payload = JSON.stringify({
-                kind: 'api-key',
-                env: { QQ_BOT_APPID: appId, QQ_BOT_SECRET: appSecret },
-              });
-              await remote.set('im-bridge/bot', payload);
-              written = true;
-            }
-          } catch { written = false; }
+            const saved = await (await fetch(`${CONTROL_BASE}/credential`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ id: 'qq', env: { QQ_BOT_APPID: appId, QQ_BOT_SECRET: appSecret } }),
+            })).json();
+            written = saved?.ok === true;
+            if (written !== true) saveError = String(saved?.message ?? '');
+          } catch (error) {
+            saveError = String(error?.message ?? error);
+          }
 
           saveConfig({ appId, appSecret, sandbox });
 
@@ -649,7 +790,12 @@ window.__ModuleLoader__.load({
             setForm((prev) => ({ ...prev, appSecret: '' }));
             setStatus({ kind: 'ok', text: '已保存到本机。Host 侧正在连接 QQ，稍候在手机 QQ 里给机器人发一条消息试试。' });
           } else {
-            setStatus({ kind: 'note', text: '已记在浏览器里，但**没写进 Host 凭据存储** —— 插件不会用它连接。请重启客户端后重试，或看 Host 日志。' });
+            setStatus({
+              kind: 'err',
+              text: saveError === ''
+                ? '没写进 Host 凭据存储（原因未知）—— 插件不会用它连接，请看 Host 日志。'
+                : `没写进 Host 凭据存储：${saveError}`,
+            });
           }
         } catch (error) {
           setStatus({ kind: 'err', text: `失败：${error?.message ?? error}` });
@@ -818,6 +964,46 @@ window.__ModuleLoader__.load({
     ];
 
     const PLATFORM_BY_ID = new Map(PLATFORMS.map((p) => [p.id, p]));
+
+    /**
+     * 每个平台要在设置页填哪几个字段。
+     *
+     * ⚠ 字段名必须和宿主 `PLATFORM_CREDENTIAL_KEYS` 那套 env 键**逐字对应** ——
+     *   两端各写一份字符串是本项目踩过的坑（改名时漏了一边 → 六个端点全 404）。
+     *   这里由 verify 脚本交叉比对。
+     *
+     * 微信是空的：它没有静态凭据，靠**扫码**换 bot_token（存在宿主侧）。
+     */
+    const PLATFORM_FIELDS = {
+      qq: [
+        { key: 'QQ_BOT_APPID', label: 'AppID', placeholder: 'q.qq.com 机器人后台 → 开发设置' },
+        { key: 'QQ_BOT_SECRET', label: 'AppSecret', secret: true },
+      ],
+      weixin: [],
+      feishu: [
+        { key: 'FEISHU_APP_ID', label: 'App ID', placeholder: 'open.feishu.cn → 开发者后台 → 凭证与基础信息' },
+        { key: 'FEISHU_APP_SECRET', label: 'App Secret', secret: true },
+      ],
+      dingtalk: [
+        { key: 'DINGTALK_CLIENT_ID', label: 'Client ID（AppKey）', placeholder: 'open.dingtalk.com → 应用信息' },
+        { key: 'DINGTALK_CLIENT_SECRET', label: 'Client Secret（AppSecret）', secret: true },
+        { key: 'DINGTALK_ROBOT_CODE', label: 'RobotCode（可留空）', placeholder: '机器人的 robotCode，发消息时要用' },
+      ],
+      wecom: [
+        { key: 'WECOM_BOT_ID', label: '机器人 ID（bot_id）', placeholder: '企业微信后台 → 应用管理 → 智能机器人' },
+        { key: 'WECOM_BOT_SECRET', label: 'Secret', secret: true },
+      ],
+    };
+
+    /** 阶段 → 界面上那句话 + 颜色。宿主返回的 phase 是唯一真相。 */
+    const PHASE_TEXT = {
+      idle: '未测试',
+      connecting: '连接中…',
+      'need-scan': '等你扫码',
+      verified: '凭据可用',
+      connected: '已连接',
+      error: '出错',
+    };
 
     /**
      * 侧边栏入口的"在线"广播通道。

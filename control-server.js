@@ -138,7 +138,7 @@ export function readStatusSnapshot() {
  * @param {(msg: string) => void} options.log
  * @returns {{ dispose: () => void, port: number }}
  */
-export function startStatusServer({ log, getMessages, sendToAgent, listModels, setModel, getCredential, getPlatforms, setPlatform }) {
+export function startStatusServer({ log, getMessages, sendToAgent, listModels, setModel, getCredential, getPlatforms, setPlatform, testPlatform, pollWeixinLogin, savePlatformCredential }) {
   const server = createServer((req, res) => {
     const remote = req.socket.remoteAddress ?? '';
     const origin = String(req.headers.origin ?? '');
@@ -300,6 +300,73 @@ export function startStatusServer({ log, getMessages, sendToAgent, listModels, s
           } catch (error) {
             res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: false, error: String(error?.message ?? error) }));
+          }
+        });
+      })();
+      return;
+    }
+
+    // ── 设置页：「测试连接」──
+    //
+    // 四个平台的能力**刻意不同**，返回值用 phase 如实区分，界面照它显示：
+    //   weixin → need-scan（要扫码）/ connected（已连上，回显工作中）
+    //   wecom  → connecting → connected（真长连接；不保证能回复）
+    //   feishu / dingtalk → verified（**只验证凭据可用**，不等于能收消息）
+    if (url.pathname === '/im-bridge/test' && req.method === 'POST') {
+      void (async () => {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; if (body.length > 16 * 1024) req.destroy(); });
+        req.on('end', async () => {
+          try {
+            const parsed = JSON.parse(body === '' ? '{}' : body);
+            const result = await testPlatform?.(String(parsed.id ?? ''));
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(result ?? { ok: false, phase: 'error', message: '没有 testPlatform 处理函数' }));
+          } catch (error) {
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, phase: 'error', message: String(error?.message ?? error) }));
+          }
+        });
+      })();
+      return;
+    }
+
+    // ── 设置页：微信扫码状态轮询（界面每 1.5 秒调一次）──
+    if (url.pathname === '/im-bridge/weixin/poll' && req.method === 'POST') {
+      void (async () => {
+        try {
+          const result = await pollWeixinLogin?.();
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(result ?? { ok: false, pending: false, message: '没有轮询处理函数' }));
+        } catch (error) {
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, phase: 'error', message: String(error?.message ?? error) }));
+        }
+      })();
+      return;
+    }
+
+    // ── 设置页：保存某个平台的凭据 ──
+    //
+    // ⚠ 走宿主写，而不是浏览器直接写 credentials —— 客户端侧那条路是坏的
+    //   （`factory(require)` 里没有 `ctx`，`ctx?.remote` 会抛 ReferenceError
+    //    然后被 catch 吞掉）。详见 index.js 里 savePlatformCredential 的说明。
+    //
+    // 安全：这个服务只监听 127.0.0.1，且每个请求都二次校验来源是回环地址。
+    //       密钥只在"浏览器 → 本机回环接口"之间传，不出机器。
+    if (url.pathname === '/im-bridge/credential' && req.method === 'POST') {
+      void (async () => {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; if (body.length > 32 * 1024) req.destroy(); });
+        req.on('end', async () => {
+          try {
+            const parsed = JSON.parse(body === '' ? '{}' : body);
+            const result = await savePlatformCredential?.(String(parsed.id ?? ''), parsed.env ?? {});
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(result ?? { ok: false, message: '没有 savePlatformCredential 处理函数' }));
+          } catch (error) {
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, message: String(error?.message ?? error) }));
           }
         });
       })();

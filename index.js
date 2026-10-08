@@ -30,6 +30,15 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { startStatusServer } from './control-server.js';
 import { createBusyTracker } from './busy-tracker.js';
+import {
+  probeFeishu,
+  probeDingtalk,
+  weixinStartLogin,
+  weixinPollLogin,
+  startWeixinLoop,
+  startWecomLoop,
+  describeError,
+} from './transports.js';
 
 /**
  * 状态文件 —— 让插件的行为可被外部观测。
@@ -58,6 +67,27 @@ const STATUS_JSON = join(STATUS_DIR, 'im-bridge-status.json');
 // ⚠ QQ 通道**不允许关闭**：这个会话本身就跑在它上面，关掉等于把通信掐断。
 //   setPlatformEnabled 会明确拒绝，而不是静默忽略。
 const PLATFORM_IDS = ['qq', 'weixin', 'feishu', 'dingtalk', 'wecom'];
+
+/**
+ * 各平台凭据在 credentials 服务里的键。
+ *
+ * ⚠ **QQ 刻意保持旧键 `im-bridge/bot` 不动**：它是当前正在工作的通道，
+ *   改名要连带迁移，而迁移期间一旦出错就等于把自己和外界的联系掐断。
+ *   等新平台都稳了、有独立的重启窗口时再改（已写进待办）。
+ *
+ * ⚠ 键名通用化、值装各平台自己的字段（沿用既有分层约定，见原 CREDENTIAL_KEY 注释）：
+ *   feishu   → FEISHU_APP_ID / FEISHU_APP_SECRET
+ *   dingtalk → DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET / DINGTALK_ROBOT_CODE
+ *   wecom    → WECOM_BOT_ID / WECOM_BOT_SECRET
+ *   weixin   → 无静态凭据（扫码换 bot_token，存在 im-bridge-weixin.json）
+ */
+const PLATFORM_CREDENTIAL_KEYS = {
+  qq: 'im-bridge/bot',
+  weixin: 'im-bridge/weixin',
+  feishu: 'im-bridge/feishu',
+  dingtalk: 'im-bridge/dingtalk',
+  wecom: 'im-bridge/wecom',
+};
 
 const PLATFORMS_FILE = join(STATUS_DIR, 'im-bridge-platforms.json');
 
@@ -777,7 +807,9 @@ export function apply(ctx, config = {}) {
 
   /** 给客户端读（控制接口用）；ids 一并给出去，界面不用自己维护平台清单 */
   function getPlatformsInfo() {
-    return { ok: true, platforms: { ...platformState }, ids: [...PLATFORM_IDS] };
+    const status = {};
+    for (const [id, value] of platformRuntime) status[id] = value;
+    return { ok: true, platforms: { ...platformState }, status, ids: [...PLATFORM_IDS] };
   }
 
   /**
@@ -795,6 +827,233 @@ export function apply(ctx, config = {}) {
     const saved = savePlatforms();
     recordStatus('platform-set', { id, enabled: enabled === true, saved });
     return { ok: true, saved, platforms: { ...platformState } };
+  }
+
+  // ---- 各平台的连接状态 + 「测试连接」（实现在 transports.js）
+  //
+  // 为什么状态要放在宿主：客户端读不到文件、也拿不到凭据。
+  // 界面每次轮询 /platforms 就能同时拿到"开关"和"连上没连上"。
+  const platformRuntime = new Map();   // id -> { phase, message, detail, at }
+  const WEIXIN_STATE_FILE = join(STATUS_DIR, 'im-bridge-weixin.json');
+
+  function setRuntime(id, phase, message, detail) {
+    platformRuntime.set(id, { phase, message: String(message ?? '').slice(0, 240), detail: detail ?? null, at: Date.now() });
+    recordStatus('platform-runtime', { id, phase, message: String(message ?? '').slice(0, 160) });
+  }
+  for (const id of PLATFORM_IDS) setRuntime(id, 'idle', '');
+
+  let weixinLoop = null;
+  let wecomLoop = null;
+  let weixinLogin = null;   // { qrcode, qrUrl, startedAt }
+
+  /** 微信 bot_token 存在本机 —— 重启后不用重新扫码 */
+  function readWeixinToken() {
+    try {
+      const parsed = JSON.parse(readFileSync(WEIXIN_STATE_FILE, 'utf8'));
+      const token = String(parsed?.botToken ?? '').trim();
+      return token === '' ? null : token;
+    } catch { return null; }
+  }
+  function writeWeixinToken(botToken) {
+    try {
+      writeFileSync(WEIXIN_STATE_FILE, JSON.stringify({ botToken, savedAt: new Date().toISOString() }, null, 2), 'utf8');
+    } catch (error) {
+      recordStatus('weixin-token-save-failed', { message: describeError(error) });
+    }
+  }
+
+  /**
+   * 读某个平台的凭据 env。
+   *
+   * ⚠ 键名各平台不同，**集中在这一处映射**，别散到各处去写 ——
+   *   散开就会出现"加平台时漏改一处"（这个项目里已经发生过同类事故）。
+   */
+  async function readPlatformEnv(id) {
+    const key = PLATFORM_CREDENTIAL_KEYS[id];
+    if (key === undefined) return {};
+    try {
+      const record = await ctx.credentials.readRecord(key);
+      if (record === undefined || record.kind !== 'api-key') return {};
+      return record.env ?? {};
+    } catch (error) {
+      recordStatus('platform-credential-read-failed', { id, message: describeError(error) });
+      return {};
+    }
+  }
+
+  /** 微信：起长轮询 + 测试回显（先证明收发两个方向都通，再谈接 agent） */
+  function startWeixinWithLoop(token) {
+    if (weixinLoop !== null) { weixinLoop.dispose(); weixinLoop = null; }
+    weixinLoop = startWeixinLoop({
+      token,
+      onInbound: (text) => { recordStatus('weixin-inbound-text', { text: text.slice(0, 80) }); },
+      onEvent: (event, detail) => {
+        recordStatus(event, detail ?? {});
+        if (event === 'weixin-replied') {
+          setRuntime('weixin', 'connected', '已连接 —— 测试回显工作中（发消息会收到「测试回显」）');
+        }
+        if (event === 'weixin-reply-failed') {
+          setRuntime('weixin', 'error', `能收但回不出去：${detail?.message ?? ''}`);
+        }
+        if (event === 'weixin-poll-failed' && Number(detail?.failures ?? 0) >= 3) {
+          setRuntime('weixin', 'error', `轮询连续失败 ${detail?.failures} 次：${detail?.message ?? ''}`);
+        }
+      },
+    });
+    setRuntime('weixin', 'connected', '长轮询已启动（测试回显）—— 现在给「微信 ClawBot」发一条消息试试');
+    return { ok: true, message: '已连接：去微信里给 ClawBot 发一条消息，它会回显给你', phase: 'connected' };
+  }
+
+  /**
+   * 「测试连接」—— 界面点一下就走这里。
+   *
+   * 四个平台的能力**刻意不同**，返回值里的 phase 要如实反映：
+   *   weixin   → need-scan / connected（真连接 + 回显）
+   *   wecom    → connecting → connected（真长连接；但不保证能回复）
+   *   feishu   → verified（只验证凭据可用）
+   *   dingtalk → verified（只验证凭据可用）
+   */
+  async function testPlatform(id) {
+    if (!PLATFORM_IDS.includes(id)) return { ok: false, message: `未知平台：${String(id)}`, phase: 'error' };
+
+    if (id === 'qq') {
+      return {
+        ok: true,
+        phase: 'connected',
+        message: 'QQ 通道是常驻的，不用测试 —— 看设置页最上面的实时状态即可',
+      };
+    }
+
+    setRuntime(id, 'connecting', '正在测试…');
+
+    if (id === 'feishu') {
+      const env = await readPlatformEnv(id);
+      const result = await probeFeishu({
+        appId: String(env.FEISHU_APP_ID ?? '').trim(),
+        appSecret: String(env.FEISHU_APP_SECRET ?? '').trim(),
+      });
+      setRuntime(id, result.ok ? 'verified' : 'error', result.message, result.detail);
+      return { ...result, phase: result.ok ? 'verified' : 'error' };
+    }
+
+    if (id === 'dingtalk') {
+      const env = await readPlatformEnv(id);
+      const clientId = String(env.DINGTALK_CLIENT_ID ?? '').trim();
+      const clientSecret = String(env.DINGTALK_CLIENT_SECRET ?? '').trim();
+      const robotCode = String(env.DINGTALK_ROBOT_CODE ?? '').trim();
+      const result = await probeDingtalk({ clientId, clientSecret });
+      // ⚠ RobotCode 在握手阶段用不上（发消息才要），但**必须读一下并反馈** ——
+      //   否则界面上填了它却永远没回音，用户会以为填丢了。
+      //   （这正是"两端各写一份字符串"那类漏改：已由 diag 脚本交叉比对兜住。）
+      if (result.ok === true && robotCode !== '') {
+        result.message += `；RobotCode 已保存（${robotCode.slice(0, 8)}…，发消息时用）`;
+        result.detail = { ...(result.detail ?? {}), hasRobotCode: true };
+      }
+      setRuntime(id, result.ok ? 'verified' : 'error', result.message, result.detail);
+      return { ...result, phase: result.ok ? 'verified' : 'error' };
+    }
+
+    if (id === 'weixin') {
+      // 已有 token（扫过码）→ 直接起长轮询，不用再扫
+      const existing = readWeixinToken();
+      if (existing !== null) return startWeixinWithLoop(existing);
+
+      const login = await weixinStartLogin([]);
+      if (login.ok !== true) {
+        setRuntime(id, 'error', login.message);
+        return { ...login, phase: 'error' };
+      }
+      weixinLogin = { qrcode: login.qrcode, qrUrl: login.qrUrl, startedAt: Date.now() };
+      setRuntime(id, 'need-scan', '等你扫码');
+      return { ok: true, phase: 'need-scan', needScan: true, qrcode: login.qrcode, qrUrl: login.qrUrl, message: login.message };
+    }
+
+    if (id === 'wecom') {
+      const env = await readPlatformEnv(id);
+      const botId = String(env.WECOM_BOT_ID ?? '').trim();
+      const secret = String(env.WECOM_BOT_SECRET ?? '').trim();
+      if (botId === '' || secret === '') {
+        const message = '请先填机器人 ID 和 Secret（企业微信后台 → 应用管理 → 智能机器人）';
+        setRuntime(id, 'error', message);
+        return { ok: false, phase: 'error', message };
+      }
+      if (wecomLoop !== null) { wecomLoop.dispose(); wecomLoop = null; }
+      wecomLoop = startWecomLoop({
+        botId,
+        secret,
+        onInbound: (text) => { recordStatus('wecom-inbound-text', { text: text.slice(0, 80) }); },
+        onEvent: (event, detail) => {
+          recordStatus(event, detail ?? {});
+          if (event === 'wecom-subscribed') setRuntime('wecom', 'connected', '长连接已就绪（能收消息；回复帧形状官方未公开，暂不回）');
+          if (event === 'wecom-subscribe-rejected') setRuntime('wecom', 'error', `订阅被拒：errcode=${detail?.errcode ?? '?'} ${detail?.errmsg ?? ''}`);
+          if (event === 'wecom-give-up') setRuntime('wecom', 'error', '反复连接失败，已停止重试 —— 检查网络或凭据');
+        },
+      });
+      return { ok: true, phase: 'connecting', message: '正在建立长连接…几秒后看状态' };
+    }
+
+    return { ok: false, phase: 'error', message: `平台 ${String(id)} 还没有测试实现` };
+  }
+
+  /**
+   * 从界面保存某个平台的凭据 —— **由宿主写**，不由浏览器写。
+   *
+   * ⚠ 为什么必须改成这样（这是一个已确认的真 bug）：
+   *   客户端旧代码走 `ctx?.remote?.credentials`，而 `factory(require)` 里
+   *   **根本没有绑定 `ctx`**（已核：全局搜 globalThis.ctx / window.ctx 均 0 命中）。
+   *   对**未声明的标识符**，可选链 `ctx?.x` 照样抛 ReferenceError ——
+   *   它被外层 `catch { written = false }` 吞掉，于是设置页点「连接」
+   *   永远提示"没写进 Host 凭据存储"。静默失败，界面还以为自己试过了。
+   *
+   * 现在改成：浏览器 POST 到回环控制接口，宿主用 credentials 服务落盘，
+   * 写完**回读确认**才算成功（别相信"写调用没抛错"就等于写进去了）。
+   */
+  async function savePlatformCredential(id, env) {
+    const key = PLATFORM_CREDENTIAL_KEYS[id];
+    if (key === undefined) return { ok: false, message: `未知平台：${String(id)}` };
+    if (env === null || typeof env !== 'object') return { ok: false, message: '凭据内容不合法' };
+
+    try {
+      const credentials = ctx.credentials;
+      if (typeof credentials?.modifyRecord !== 'function') {
+        return {
+          ok: false,
+          message: '这台 DSH 的 credentials 服务缺少写方法（modifyRecord）—— 没法从界面保存，请用 dsh CLI 写',
+        };
+      }
+      await credentials.modifyRecord(key, async () => ({ kind: 'api-key', env }));
+      const written = await credentials.readRecord(key);
+      if (written === undefined) {
+        return { ok: false, message: '写入后回读为空 —— 凭据没保存成功' };
+      }
+      recordStatus('platform-credential-saved', { id, fields: Object.keys(env).length });
+      return { ok: true, message: '凭据已保存到本机' };
+    } catch (error) {
+      recordStatus('platform-credential-save-failed', { id, message: describeError(error) });
+      return { ok: false, message: `保存失败：${describeError(error)}` };
+    }
+  }
+
+  /** 微信扫码轮询（界面每 1.5 秒调一次） */
+  async function pollWeixinLoginOnce() {    if (weixinLogin === null) return { ok: false, message: '没有进行中的登录，请重新点「测试连接」', phase: 'error' };
+    if (Date.now() - weixinLogin.startedAt > 5 * 60_000) {
+      weixinLogin = null;
+      setRuntime('weixin', 'error', '二维码已过期（5 分钟）');
+      return { ok: false, message: '二维码已过期（5 分钟），请重新点「测试连接」', phase: 'error' };
+    }
+    const data = await weixinPollLogin(weixinLogin.qrcode);
+    if (data?.status === 'confirmed' && typeof data?.bot_token === 'string' && data.bot_token !== '') {
+      const token = data.bot_token;
+      weixinLogin = null;
+      writeWeixinToken(token);
+      return startWeixinWithLoop(token);
+    }
+    if (data?.status === 'error') {
+      const message = String(data?.message ?? '轮询出错');
+      setRuntime('weixin', 'error', message);
+      return { ok: false, message, phase: 'error' };
+    }
+    return { ok: true, pending: true, status: String(data?.status ?? 'wait'), message: '等扫码…', phase: 'need-scan' };
   }
 
   // ---- 驱动问题（踩过的大坑）：
@@ -2312,6 +2571,11 @@ export function apply(ctx, config = {}) {
       // 侧边栏用：哪些平台启用 —— 界面据此**动态注册 / 注销**图标条目
       getPlatforms: getPlatformsInfo,
       setPlatform: setPlatformEnabled,
+      // 设置页用：「测试连接」按平台分发（微信还有扫码轮询）
+      testPlatform,
+      pollWeixinLogin: pollWeixinLoginOnce,
+      // 设置页用：保存某个平台的凭据（宿主侧写，绕开客户端那条坏路）
+      savePlatformCredential,
     });
   } catch (error) {
     recordStatus('status-server-start-failed', { message: String(error?.message ?? error) });
@@ -2322,6 +2586,13 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => () => {
     qq?.dispose();
     control?.dispose();
+    // 各平台的长连接也要断 —— 尤其是企业微信：**每个机器人只允许一条连接**，
+    // 留着旧连接会让下次连接把新连接顶掉（表现为"刚连上就断"）。
+    try { weixinLoop?.dispose(); } catch { /* ignore */ }
+    try { wecomLoop?.dispose(); } catch { /* ignore */ }
+    weixinLoop = null;
+    wecomLoop = null;
+    weixinLogin = null;
     if (watchdog !== null) {
       clearInterval(watchdog);
       watchdog = null;
