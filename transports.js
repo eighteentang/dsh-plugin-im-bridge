@@ -350,6 +350,16 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
         toUserId: String(message.from_user_id ?? '').slice(0, 24),
         hasContextToken: typeof message.context_token === 'string' && message.context_token !== '',
         contextTokenLen: String(message.context_token ?? '').length,
+        /**
+         * 从**收到用户消息**到**发出这条回复**的毫秒数。
+         *
+         * ⚠ 这个数字是排查"服务端受理了但用户没收到"的关键变量：
+         *   唯一已知的成功案例是"收到后立刻发"（~0.4 秒），
+         *   而失败的那些都是等 agent 干完活（1~11 秒）才发。
+         *   如果 iLink 的 context_token 只在短时间内有效，时延就会是根因。
+         *   用户报"收到/没收到"时，拿这个数字一对就能判断。
+         */
+        sinceInboundMs: typeof message.__receivedAt === 'number' ? Date.now() - message.__receivedAt : null,
         body: raw,
       });
       return true;
@@ -382,6 +392,14 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
           if (message?.message_type !== 1) continue;
           const text = String(message?.item_list?.[0]?.text_item?.text ?? '').trim();
           if (text === '') continue;
+          // 记下"收到这条消息的时刻"，发出时算时延。
+          //
+          // ⚠ 为什么要算它（2026-10-08 排查用）：实测现象是"服务端受理了
+          //   （返回了 message_id）但用户没收到"，而唯一的已知成功案例是
+          //   **收到后 0.4 秒内立刻发**的那次。所以时延是个关键变量 ——
+          //   iLink 的 `context_token` 有可能只在短时间内有效。
+          //   把时延记下来，就能和"用户到底收没收到"对上号。
+          message.__receivedAt = Date.now();
           onEvent?.('weixin-inbound', { chars: text.length });
           lastMessage = message;
           // 把这条消息专属的回复闭包交上去
