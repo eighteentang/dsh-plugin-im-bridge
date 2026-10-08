@@ -1103,9 +1103,31 @@ window.__ModuleLoader__.load({
      *     dingtalk ⚠️ 有 startDingtalkStream（收）；出站未实现，且要装 SDK 组件
      *     feishu   ⚠️ 有 startFeishuWs（收）；出站未实现，且要装 SDK 组件
      */
+    /**
+     * ⚠ `order` 为什么从 20..24 挪到 100..104（2026-10-08）：
+     *
+     * 侧边栏是**一条全局列表**，按 `order` 升序排 —— 而**没有分组/嵌套能力**
+     * （`sidebar.panellist` 的注册契约只有 `id` / `order` / `label`）。
+     * 所以只要别的插件用了和我们**相同或相邻**的 order，它就会插到我们中间。
+     *
+     * 实测就撞上了：装了一个新插件（`dsh-context`），它用 `order: 20` ——
+     * 和企鹅**同分**，于是它夹在企鹅和微信之间：
+     *
+     *     plugins(0)  schedules(10)  qq-panel(20)  dsh-context(20)  weixin-panel(21)
+     *
+     * 现在的取值策略：
+     *   · **整体排到最后**（100 起）—— DSH 自带的是 0 / 10，第三方插件的面板
+     *     跟在它们后面更符合这个侧边栏的设计意图
+     *   · **彼此紧凑**（100..104 连续）—— 我们自己的面板不该被自己拆开
+     *   · **和常见区间拉开**（别人多取 0/10/20/30 那几档）—— 降低再次撞车的概率
+     *
+     * ⚠ 这只是"降低概率"，**不是保证**：另一个插件完全可以也取 100。
+     *   要彻底解决得让侧边栏支持分组，那是 DSH 侧的能力，不是插件能给的。
+     *   （同一份说明也写在两条静态注册注释里，免得只看注册处的人不知道缘由。）
+     */
     const PLATFORMS = [
       {
-        id: 'qq', panelId: 'qq-panel', title: '奇怪的企鹅', order: 20, art: PenguinArt, live: true,
+        id: 'qq', panelId: 'qq-panel', title: '奇怪的企鹅', order: 100, art: PenguinArt, live: true,
         maturity: 'full', maturityText: '完整可用 —— 收发 + agent',
         accent: '#2B2F38',
         emptyTitle: '这里是企鹅的窝',
@@ -1125,7 +1147,7 @@ window.__ModuleLoader__.load({
         //   （扫码换 token + 长轮询收 + sendmessage 发 + 已接 agent），
         //   只是**面板**当初没跟着接上，才一直被渲染成"占位壳"。
         //   现在面板是共用的，所以这里如实标 true —— 点进去能看到真实对话、也能发。
-        id: 'weixin', panelId: 'weixin-panel', title: '微信绿泡泡', order: 21, art: WeixinArt, live: true,
+        id: 'weixin', panelId: 'weixin-panel', title: '微信绿泡泡', order: 101, art: WeixinArt, live: true,
         maturity: 'full', maturityText: '完整可用 —— 收发 + agent',
         accent: '#07C160',
         emptyTitle: '绿泡泡还没接上',
@@ -1141,7 +1163,7 @@ window.__ModuleLoader__.load({
         },
       },
       {
-        id: 'wecom', panelId: 'wecom-panel', title: '企业微信', order: 22, art: WecomArt, live: false,
+        id: 'wecom', panelId: 'wecom-panel', title: '企业微信', order: 102, art: WecomArt, live: false,
         maturity: 'inbound', maturityText: '只能收 —— 发不回去',
         accent: '#2F7DFF',
         emptyTitle: '企业微信只能收，不能回',
@@ -1150,7 +1172,7 @@ window.__ModuleLoader__.load({
           + '只能服务企业内部成员。',
       },
       {
-        id: 'feishu', panelId: 'feishu-panel', title: '飞书Bot', order: 23, art: FeishuArt, live: false,
+        id: 'feishu', panelId: 'feishu-panel', title: '飞书Bot', order: 103, art: FeishuArt, live: false,
         maturity: 'inbound', maturityText: '能收，但发不回去',
         accent: '#3370FF',
         emptyTitle: '飞书还没接上出站',
@@ -1159,7 +1181,7 @@ window.__ModuleLoader__.load({
           + '要先在设置页安装可选组件，且这一家的实现成本最高。',
       },
       {
-        id: 'dingtalk', panelId: 'dingtalk-panel', title: '钉钉Bot', order: 24, art: DingtalkArt, live: false,
+        id: 'dingtalk', panelId: 'dingtalk-panel', title: '钉钉Bot', order: 104, art: DingtalkArt, live: false,
         maturity: 'inbound', maturityText: '能收，但发不回去',
         accent: '#3296FA',
         emptyTitle: '钉钉还没接上出站',

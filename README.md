@@ -122,7 +122,7 @@ AppSecret   —— 一串字母数字，**不要外传**
 DSH 自带插件管理命令：
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.3
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.4
 ```
 
 > **`--profile` 的名字**：填**你自己的** profile 名 —— 看 `~/.dsh/profiles/`
@@ -155,7 +155,7 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-br
 
 ```sh
 # 装某个具体版本
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.3
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.4
 
 # 看有哪些版本可选
 #   https://github.com/eighteentang/dsh-plugin-im-bridge/tags
@@ -171,7 +171,7 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-br
 ### 升级
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.3   # 换成的版本号
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.4   # 换成的版本号
 ```
 
 然后**重启客户端**。
@@ -188,7 +188,7 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-br
 看 profile 里那份 `package.json` 的 `dsh-plugin-im-bridge` 字段：
 
 ```sh
-# 装了标签版 → 显示 github:eighteentang/dsh-plugin-im-bridge#v1.2.3
+# 装了标签版 → 显示 github:eighteentang/dsh-plugin-im-bridge#v1.2.4
 # 装了浮动版 → 显示 github:eighteentang/dsh-plugin-im-bridge
 cat ~/.dsh/profiles/<profile名>/package.json
 ```
