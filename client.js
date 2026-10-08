@@ -909,7 +909,12 @@ window.__ModuleLoader__.load({
         ensureStyle();
         const size = typeof props?.size === 'number' && props.size > 0 ? props.size : 28;
         const active = props?.active === true;
-        const online = meta.live === true && useLinkUp();
+        // ⚠ useLinkUp() 必须**无条件调用**（hooks 规则）——
+        //   不能写成 `meta.live === true && useLinkUp()`：`&&` 短路会让这个
+        //   hook 有时执行有时不执行。这里 meta.live 是常量所以目前不会炸，
+        //   但等哪天它变成动态值（比如"接入后立刻亮灯"），那就是真 bug。
+        const linked = useLinkUp();
+        const online = meta.live === true && linked;
 
         return h('div', {
           className: active ? 'qqb-penguin qqb-penguin-active' : 'qqb-penguin',
