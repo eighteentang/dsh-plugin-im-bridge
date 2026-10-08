@@ -872,6 +872,17 @@ export function apply(ctx, config = {}) {
     platformRuntime.set(id, { phase, message: String(message ?? '').slice(0, 240), detail: detail ?? null, at: Date.now() });
     recordStatus('platform-runtime', { id, phase, message: String(message ?? '').slice(0, 160) });
   }
+  /**
+   * 读某个平台的连接状态 —— 给**每个平台的面板**判断"在线"绿灯用。
+   *
+   * ⚠ 为什么必须能按平台读（2026-10-08 加）：原来前端面板只拿得到 QQ 的连通性，
+   *   于是微信面板会用 **QQ 的连通状态**去点亮自己的绿灯 —— 两个平台的状态串了。
+   *   判据是宿主这边的 `phase === 'connected'`，不是"有没有配凭据"：
+   *   配了不等于连上（微信要扫码、企微要握手）。
+   */
+  function getPlatformRuntime(id) {
+    return platformRuntime.get(String(id ?? '')) ?? null;
+  }
   for (const id of PLATFORM_IDS) setRuntime(id, 'idle', '');
 
   let weixinLoop = null;
@@ -2389,11 +2400,18 @@ export function apply(ctx, config = {}) {
    *   只有 clientModules / slots / uiSession（那个只有 bindingSource/provide）等，
    *   没有"给我某个会话的消息"这种东西。所以数据必须由宿主半提供。
    */
-  async function getPanelMessages(limit) {
-    const read = await readPanelMessages(DEDICATED_SESSION_ID, limit);
+  async function getPanelMessages(limit, platform = 'qq') {
+    // ⚠ 必须按平台取**各自的专用会话**（2026-10-08 修）。
+    //   原来写死 `DEDICATED_SESSION_ID`（那是 QQ 的），于是：
+    //   点开微信面板看到的是 **QQ 的对话**，而自己在微信里聊的内容不在里面 ——
+    //   用户报的"聊天框里没有消息记录"就是这个。
+    //   备注：客户端 fila 时也从不带平台参数，两边都要改（见 control-server）。
+    const sessionId = dedicatedSessionId(platform);
+    const read = await readPanelMessages(sessionId, limit);
     return {
       ok: read.ok !== false,
-      sessionId: DEDICATED_SESSION_ID,
+      platform,
+      sessionId,
       source: read.source ?? null,
       total: (read.messages ?? []).length,
       messages: read.messages ?? [],
@@ -2402,11 +2420,11 @@ export function apply(ctx, config = {}) {
       // ⚠ 这两个值必须走别名集合：
       //   · busy 用 isBusy —— "忙"可能登记在队列键上（见 busyAliases 的说明）
       //   · queued 要把**所有别名**的队列长度加起来 ——
-      //     队列键是 `qq-<openid前12位>`，不是 DEDICATED_SESSION_ID，
-      //     所以原来 `queues.get(DEDICATED_SESSION_ID)` **永远是 0**（一个隐藏 bug）。
-      busy: isBusy(DEDICATED_SESSION_ID),
-      queued: queueDepth(DEDICATED_SESSION_ID),
-      info: await panelInfo(ctx.get?.('sessions')?.get?.(DEDICATED_SESSION_ID)),
+      //     队列键是 `<platform>-<peer前12位>`，不是会话 id，
+      //     所以原来 `queues.get(sessionId)` **永远是 0**（一个隐藏 bug）。
+      busy: isBusy(sessionId),
+      queued: queueDepth(sessionId),
+      info: await panelInfo(ctx.get?.('sessions')?.get?.(sessionId)),
     };
   }
 
@@ -2578,19 +2596,24 @@ export function apply(ctx, config = {}) {
    *   因为它是你本人在电脑上打的字，QQ 那边没有对应的提问，
    *   把回答推到手机上是骚扰。做法是 `openid` 传空 —— finishTurn 里会判断。
    */
-  async function sendPanelMessage(text) {
+  async function sendPanelMessage(text, platform = 'qq') {
     const clean = String(text ?? '').trim();
     if (clean === '') return { ok: false, error: 'text 为空' };
 
-    recordStatus('panel-send', { text: clean.slice(0, 80) });
-    // 用一个稳定的假 key 作为队列分组（面板不按 openid 分组）
-    const sessionId = `qq-panel:${DEDICATED_SESSION_ID}`;
-    enqueueDelivery(sessionId, clean, '', undefined);
-    return { ok: true, queued: true };
+    recordStatus('panel-send', { platform, text: clean.slice(0, 80) });
+    // ⚠ 队列分组键**要按平台**（2026-10-08 修）：原来写死 `qq-panel:`，
+    //   于是微信面板里打的消息会和 QQ 面板的排在同一条队列上，
+    //   而且投递目标也会被 resolveTargetAgent 解析成 QQ 的会话。
+    const sessionId = `${platform}-panel:${dedicatedSessionId(platform)}`;
+    // 面板消息：openid 传空（不回发到平台）—— 但**平台名要带上**，
+    // 否则 finishTurn 无法区分"这是面板输入"还是"某个平台的入站消息"。
+    enqueueDelivery(sessionId, clean, '', undefined, { platform });
+    return { ok: true, queued: true, platform };
   }
 
   // ---- 跟踪活动会话（GUI 会话有驱动，是我们优先的投递目标）
-  ctx.on('agent/created', ({ agent, source }) => {    const id = String(agent.id);
+  ctx.on('agent/created', ({ agent, source }) => {
+    const id = String(agent.id);
     const at = liveSessions.indexOf(id);
     if (at >= 0) liveSessions.splice(at, 1);
     liveSessions.push(id);
@@ -2954,6 +2977,8 @@ export function apply(ctx, config = {}) {
       // 侧边栏用：哪些平台启用 —— 界面据此**动态注册 / 注销**图标条目
       getPlatforms: getPlatformsInfo,
       setPlatform: setPlatformEnabled,
+      // 面板用：按平台读连接状态（每个平台的面板各自点亮自己的绿灯）
+      getRuntime: getPlatformRuntime,
       // 设置页用：「测试连接」按平台分发（微信还有扫码轮询）
       testPlatform,
       pollWeixinLogin: pollWeixinLoginOnce,

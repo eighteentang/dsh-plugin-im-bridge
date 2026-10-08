@@ -134,11 +134,25 @@ export function readStatusSnapshot() {
 }
 
 /**
+ * 归一化平台 id。
+ *
+ * ⚠ 为什么要有它：`platform` 是从**查询串**来的，而那可能缺失或乱填。
+ *   缺失时必须回落到 `'qq'` —— 那是这个插件最初的唯一平台，
+ *   所以"没传平台"的历史请求行为不变（向后兼容）。
+ *   乱填则当作 qq 处理（宁可给错平台的旧数据，也不要 500）。
+ */
+function normalizePlatform(raw) {
+  const value = String(raw ?? '').trim().toLowerCase();
+  if (value === '') return 'qq';
+  return /^[a-z][a-z0-9-]{0,31}$/.test(value) ? value : 'qq';
+}
+
+/**
  * @param {object} options
  * @param {(msg: string) => void} options.log
  * @returns {{ dispose: () => void, port: number }}
  */
-export function startStatusServer({ log, getMessages, sendToAgent, listModels, setModel, getCredential, getPlatforms, setPlatform, testPlatform, pollWeixinLogin, savePlatformCredential, getComponents, installComponent, removeComponent }) {
+export function startStatusServer({ log, getMessages, sendToAgent, listModels, setModel, getCredential, getPlatforms, setPlatform, testPlatform, pollWeixinLogin, savePlatformCredential, getComponents, installComponent, removeComponent, getRuntime }) {
   const server = createServer((req, res) => {
     const remote = req.socket.remoteAddress ?? '';
     const origin = String(req.headers.origin ?? '');
@@ -163,8 +177,31 @@ export function startStatusServer({ log, getMessages, sendToAgent, listModels, s
 
     const url = new URL(req.url ?? '/', `http://127.0.0.1:${CONTROL_PORT}`);
     if (url.pathname === '/im-bridge/status') {
+      // ⚠ 按平台返回连通性（2026-10-08 加）：原来这里只有 QQ 的 `connected`，
+      //   而各平台面板都要用它让"在线"绿灯亮起来 —— 微信面板拿 QQ 的连通性判断自己，
+      //   就会在 QQ 连着、微信没连时亮绿灯（反向也一样）。
+      //
+      //   `platform` 缺失时保持原样（只返回 QQ 那套快照），向后兼容。
+      const platform = String(url.searchParams.get('platform') ?? '').trim().toLowerCase();
+      const snapshot = readStatusSnapshot();
+      if (platform === '') {
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(snapshot));
+        return;
+      }
+      let runtime = null;
+      try { runtime = getRuntime?.(platform) ?? null; } catch { runtime = null; }
+      const phase = String(runtime?.phase ?? 'idle');
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify(readStatusSnapshot()));
+      res.end(JSON.stringify({
+        ...snapshot,
+        platform,
+        // 判据**只有一个**：宿主那边这个平台确实是 connected。
+        // 刻意不用"有没有配凭据"来推断 —— 配了不等于连上（微信要扫码，企微要握手）。
+        connected: phase === 'connected',
+        phase,
+        runtimeMessage: String(runtime?.message ?? ''),
+      }));
       return;
     }
 
@@ -188,11 +225,16 @@ export function startStatusServer({ log, getMessages, sendToAgent, listModels, s
     }
 
     // ── 面板：读那个专用会话的消息 ──
+    //
+    // ⚠ `platform` 参数必须有（2026-10-08 修）：原来这个端点**不区分平台**，
+    //   宿主半又写死读 QQ 会话 —— 于是点开"微信绿泡泡"面板看到的是 **QQ 的对话**，
+    //   用户自己在微信里聊的内容不在里面（用户报的"聊天框没有消息记录"）。
     if (url.pathname === '/im-bridge/messages' && req.method === 'GET') {
       const limit = Number(url.searchParams.get('limit') ?? 80);
+      const platform = normalizePlatform(url.searchParams.get('platform'));
       void (async () => {
         try {
-          const payload = await getMessages?.(Number.isFinite(limit) ? limit : 80);
+          const payload = await getMessages?.(Number.isFinite(limit) ? limit : 80, platform);
           res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify(payload ?? { ok: false, messages: [] }));
         } catch (error) {
@@ -220,7 +262,7 @@ export function startStatusServer({ log, getMessages, sendToAgent, listModels, s
               res.end(JSON.stringify({ ok: false, error: 'text 为空' }));
               return;
             }
-            const result = await sendToAgent?.(text);
+            const result = await sendToAgent?.(text, normalizePlatform(parsed.platform));
             res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify(result ?? { ok: true }));
           } catch (error) {

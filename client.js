@@ -1116,14 +1116,35 @@ window.__ModuleLoader__.load({
         accent: '#2B2F38',
         emptyTitle: '这里是企鹅的窝',
         emptyDesc: '在手机 QQ 上给它发消息，它会在这台电脑上干活；也可以直接在下面输入 —— 两条路走的是同一个大脑。',
+        // ⚠ 面板文案块（2026-10-08 加）：面板已抽成**共用实现**，
+        //   每个平台的空状态/提示语由这里给，不再写死在面板里。
+        ui: {
+          offlineHint: '去「设置 → 连接 QQ」看看',
+          emptyTitle: '这里是企鹅的窝',
+          emptyDesc: '在手机 QQ 上给它发消息，它会在这台电脑上干活；也可以直接在下面输入 —— 两条路走的是同一个大脑。',
+          placeholder: '让它干点什么…',
+          note: '回答不推手机',
+        },
       },
       {
+        // ⚠ 微信的 `live` 是 **true**（2026-10-08 修）：它的传输层确实已实现
+        //   （扫码换 token + 长轮询收 + sendmessage 发 + 已接 agent），
+        //   只是**面板**当初没跟着接上，才一直被渲染成"占位壳"。
+        //   现在面板是共用的，所以这里如实标 true —— 点进去能看到真实对话、也能发。
         id: 'weixin', panelId: 'weixin-panel', title: '微信绿泡泡', order: 21, art: WeixinArt, live: true,
         maturity: 'full', maturityText: '完整可用 —— 收发 + agent',
         accent: '#07C160',
         emptyTitle: '绿泡泡还没接上',
         emptyDesc: '微信（个人号）走官方 iLink / ClawBot 通道：扫码换 bot_token，再用长轮询收消息 —— 免公网、不需要 SDK。'
           + '已接 agent：在微信里给 ClawBot 发消息，它会用这台电脑上的 agent 回答。',
+        ui: {
+          offlineHint: '去「设置 → 连接 IM」里点微信的「测试连接」',
+          emptyTitle: '绿泡泡还没接上',
+          emptyDesc: '微信走官方 iLink / ClawBot 通道：扫码换 bot_token，再用长轮询收消息。'
+            + '在微信里给 ClawBot 发消息，它会用这台电脑上的 agent 回答；也可以直接在下面输入。',
+          placeholder: '让它干点什么…',
+          note: '回答不推微信',
+        },
       },
       {
         id: 'wecom', panelId: 'wecom-panel', title: '企业微信', order: 22, art: WecomArt, live: false,
@@ -1265,8 +1286,8 @@ window.__ModuleLoader__.load({
     /**
      * 侧边栏入口的"在线"广播通道。
      *
-     * 为什么要有它：连通性由 QqPanel 轮询（它本来就在查 /status），
-     * 而侧边栏图标是**另一个组件**。两者要共享这一个布尔值。
+     * 为什么要有它：连通性由面板轮询（它本来就在查 /status），
+     * 而侧边栏图标是**另一个组件**。两者要共享这个布尔值。
      *
      * 做法：一个极简的"模块级 pub/sub + window 上的 sidecar"。
      *   · 为什么不用 React context：这两个组件挂在不同的槽位（sidebar.panellist
@@ -1274,38 +1295,50 @@ window.__ModuleLoader__.load({
      *   · 为什么 sidecar 放 window 上：图标可能**先于**面板挂载（用户还没点开面板），
      *     那时还没有任何轮询。window 上的值让图标一挂载就能读到最近一次已知结果。
      *
+     * ⚠ 必须**按平台**存（2026-10-08 修）：原来只有一个全局布尔值，
+     *   于是微信面板的轮询会覆盖 QQ 图标的绿灯状态、反之亦然 ——
+     *   表现为"两个平台的在线灯一起亮/一起灭"，而真相是它们各自独立。
+     *
      * ⚠ 注意这里**不是**经验库 E15 说的那种"模块级可变中继" ——
      *   那一条讲的是"写进去没人读、读的人永远拿到默认值"（接线漏了却不报错）。
-     *   这里两条线都在同一个文件里接上了：QqPanel 调 publishLink() 写，
-     *   PenguinIcon 通过 useLinkUp() 读，而且**同一份值**在 window 上兜底。
+     *   这里两条线都在同一个文件里接上了：面板调 publishLink() 写，
+     *   图标通过 useLinkUp(platformId) 读，而且**同一份值**在 window 上兜底。
      */
-    const LINK_STATE_KEY = '__dshQqBridgeLink';
-    const linkSubscribers = new Set();
+    const LINK_STATE_KEY = '__dshImBridgeLink';
+    const linkSubscribers = new Map();   // platformId -> Set<setter>
 
-    /** QqPanel 每次探到连通性就调它，广播给所有订阅者 */
-    function publishLink(up) {
-      try { globalThis[LINK_STATE_KEY] = up === true; } catch { /* ignore */ }
-      for (const fn of [...linkSubscribers]) {
-        try { fn(up); } catch { /* ignore */ }
+    /** 面板每次探到连通性就调它，广播给**该平台**的所有订阅者 */
+    function publishLink(platformId, up) {
+      const id = String(platformId ?? 'qq');
+      try {
+        const all = globalThis[LINK_STATE_KEY] ?? {};
+        all[id] = up === true;
+        globalThis[LINK_STATE_KEY] = all;
+      } catch { /* ignore */ }
+      for (const fn of [...(linkSubscribers.get(id) ?? [])]) {
+        try { fn(up === true); } catch { /* ignore */ }
       }
     }
 
-    /** 订阅连通性；挂载时先用 window 上的已知值初始化 */
-    function useLinkUp() {
+    /** 订阅**某个平台**的连通性；挂载时先用 window 上的已知值初始化 */
+    function useLinkUp(platformId) {
+      const id = String(platformId ?? 'qq');
       const [up, setUp] = React.useState(() => {
-        try { return globalThis[LINK_STATE_KEY] === true; } catch { return false; }
+        try { return globalThis[LINK_STATE_KEY]?.[id] === true; } catch { return false; }
       });
       React.useEffect(() => {
-        linkSubscribers.add(setUp);
+        const set = linkSubscribers.get(id) ?? new Set();
+        linkSubscribers.set(id, set);
+        set.add(setUp);
         // 订阅时同步一次 —— 订阅前可能已经有别的组件探到了
-        try { setUp(globalThis[LINK_STATE_KEY] === true); } catch { /* ignore */ }
-        return () => { linkSubscribers.delete(setUp); };
-      }, []);
+        try { setUp(globalThis[LINK_STATE_KEY]?.[id] === true); } catch { /* ignore */ }
+        return () => { set.delete(setUp); };
+      }, [id]);
       return up;
     }
 
     /**
-     * 「奇怪的企鹅」—— 侧边栏入口图标。
+     * 通用平台图标 —— 每个平台一个实例：`makePlatformIcon(meta)`。
      *
      * ownerProps: { size: number, active: boolean }（由 sidebar.panellist 提供）
      *   · size   —— 方块边长，直接用它，别写死（不同布局下 DSH 会给不同值）
@@ -1320,31 +1353,17 @@ window.__ModuleLoader__.load({
      *   （不可靠、也不该做：那是越界，DSH 一改结构就崩）。
      *   所以把状态放在**我能控制的那块**：图标右上角。
      *   这也是通用做法（和 App 图标上的状态点一样），一眼可见。
-     */
-    function PenguinIcon(props) {
-      ensureStyle();
-      const size = typeof props?.size === 'number' && props.size > 0 ? props.size : 28;
-      const active = props?.active === true;
-      const online = useLinkUp();
-
-      return h('div', {
-        className: active ? 'qqb-penguin qqb-penguin-active' : 'qqb-penguin',
-        style: { width: size, height: size, position: 'relative' },
-        title: online ? '奇怪的企鹅（在线）' : '奇怪的企鹅（未连通 QQ）',
-        'aria-label': '奇怪的企鹅',
-      },
-      h(PenguinArt, { size: Math.round(size * 0.78) }),
-      online ? h('span', { className: 'qqb-badge-dot', 'aria-hidden': 'true' }) : null);
-    }
-
-    /**
-     * 通用平台图标 —— 每个平台一个实例：`makePlatformIcon(meta)`。
      *
-     * 刻意复用企鹅那套 class（`qqb-penguin` / `qqb-badge-dot`），所以尺寸、
+     * 刻意复用同一套 class（`qqb-penguin` / `qqb-badge-dot`），所以尺寸、
      * 悬停、选中加深、在线角标的行为**完全一致**，只是图形和提示文字换成各自的。
      *
      * ⚠ 在线角标只在 `meta.live` 为真时才可能亮 —— 没接传输层的平台画一个
      *   "在线"点等于骗人（界面上任何"结论"都必须是真的）。
+     *
+     * ⚠ 这里**没有**单独的「QQ 图标」函数（2026-10-08 删）：
+     *   它曾经是 QQ 专用的，后来这个通用版把它完全覆盖了，于是它变成死代码。
+     *   留着它会让人以为"QQ 走特殊路径" —— 实际上 QQ 现在也走这个通用版
+     *   （注册处 `makePlatformIcon(meta)`，meta 来自 PLATFORMS 表）。
      */
     function makePlatformIcon(meta) {
       const Art = meta.art;
@@ -1352,11 +1371,14 @@ window.__ModuleLoader__.load({
         ensureStyle();
         const size = typeof props?.size === 'number' && props.size > 0 ? props.size : 28;
         const active = props?.active === true;
-        // ⚠ useLinkUp() 必须**无条件调用**（hooks 规则）——
-        //   不能写成 `meta.live === true && useLinkUp()`：`&&` 短路会让这个
+        // ⚠ useLinkUp(平台) 必须**无条件调用**（hooks 规则）——
+        //   不能写成 `meta.live === true && useLinkUp(meta.id)`：`&&` 短路会让这个
         //   hook 有时执行有时不执行。这里 meta.live 是常量所以目前不会炸，
         //   但等哪天它变成动态值（比如"接入后立刻亮灯"），那就是真 bug。
-        const linked = useLinkUp();
+        //
+        //   ⚠ 要传平台 id（2026-10-08 修）：原来读的是**全局**那一个布尔值，
+        //     于是微信的绿灯会跟着 QQ 的连通状态亮/灭。
+        const linked = useLinkUp(meta.id);
         const online = meta.live === true && linked;
 
         return h('div', {
@@ -1373,16 +1395,39 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 「奇怪的企鹅」面板 —— 显示 QQ 那个专用会话的消息，并能从电脑上继续发消息。
+     * **共用**的「真实会话」面板 —— QQ 和微信都用它，只是传进来的 `meta` 不同
+     * （调用方用 `QqPanel.bind(null, meta)` 传，见下方注册处）。
      *
      * 数据来源：宿主半的 8799 接口（**客户端没有会话数据 API**，查证过）：
-     *   GET  /im-bridge/messages?limit=N   → 那个会话的最近消息
-     *   POST /im-bridge/send  {text}       → 投给 agent（和手机消息走同一条路）
+     *   GET  /im-bridge/messages?limit=N&platform=<id>  → **那个平台**专用会话的消息
+     *   POST /im-bridge/send  {text, platform}          → 投给该平台的 agent
+     *   GET  /im-bridge/status?platform=<id>            → **那个平台**的连通性
+     *
+     * ⚠ 三个接口都必须带 platform（2026-10-08 修）。原来它们都是 QQ 专用
+     *   （写死会话 id + 不带平台参数），于是点开微信面板：
+     *   · 显示的是 **QQ 的对话**（用户报的"没有消息记录"）
+     *   · 在线绿灯用的是 **QQ 的连通状态**（两个平台的状态串了）
+     *   而 `platform` 缺失时后端回落到 QQ，所以"只有一个平台"的历史行为不变。
      *
      * 轮询而不是推送：8799 是个极简的 http 服务，没有 WebSocket。
      * 2 秒一次的开销可以忽略（本机回环），换来的是实现简单、不需要处理重连。
      */
-    function QqPanel() {
+    function QqPanel(meta) {
+      // 调用方一定传 meta；但这个默认值让"漏传"表现为一个能看懂的界面，
+      // 而不是 `meta.art is not a function` 之类的崩溃（客户端插件崩溃 = 整块空白）
+      const m = meta ?? {};
+      const Art = m.art ?? PenguinArt;
+      const platformId = m.id ?? 'qq';
+      const platformTitle = m.title ?? '奇怪的企鹅';
+      const ui = m.ui ?? {
+        offlineHint: '去「设置 → 连接 QQ」看看',
+        emptyTitle: '这里是企鹅的窝',
+        emptyDesc: '在手机 QQ 上给它发消息，它会在这台电脑上干活；'
+          + '也可以直接在下面输入 —— 两条路走的是同一个大脑。',
+        placeholder: '让它干点什么…',
+        note: '回答不推手机',
+      };
+
       ensureStyle();
       const [data, setData] = React.useState(null);
       const [linkUp, setLinkUp] = React.useState(false);
@@ -1394,14 +1439,17 @@ window.__ModuleLoader__.load({
 
       const load = React.useCallback(async () => {
         try {
-          const response = await fetch(CONTROL_BASE + '/messages?limit=80', { method: 'GET' });
+          const response = await fetch(
+            CONTROL_BASE + '/messages?limit=80&platform=' + encodeURIComponent(platformId),
+            { method: 'GET' },
+          );
           const json = await response.json();
           setData(json);
           setError(json?.ok === false ? String(json.error ?? '读取失败') : '');
         } catch (err) {
           setError('连不上插件（Host 侧没在跑？）');
         }
-      }, []);
+      }, [platformId]);
 
       React.useEffect(() => {
         void load();
@@ -1412,8 +1460,11 @@ window.__ModuleLoader__.load({
       /**
        * 在线状态 —— 单独查一次 /status（/messages 不返回连通性）。
        *
+       * ⚠ 必须带 platform（2026-10-08 修）：不带的话后端返回的是 **QQ 的**
+       *   连通状态，于是微信面板会用 QQ 的状态点亮自己的绿灯。
+       *
        * 判据刻意用**严格的 `=== true`**：只要不是明确连通，就不显示绿灯。
-       * 这样"没配 AppID"（没凭据）、"正在连"、"连上过又断了"都自然落到"不显示"，
+       * 这样"没配凭据"、"正在连"、"连上过又断了"都自然落到"不显示"，
        * 不需要在客户端猜原因 —— 根因看设置页的状态面板就够了。
        *
        * 6 秒一次：连通性变化没那么频繁，而且它比消息轮询轻。
@@ -1422,18 +1473,21 @@ window.__ModuleLoader__.load({
         let alive = true;
         const probe = async () => {
           try {
-            const response = await fetch(CONTROL_BASE + '/status', { method: 'GET' });
+            const response = await fetch(
+              CONTROL_BASE + '/status?platform=' + encodeURIComponent(platformId),
+              { method: 'GET' },
+            );
             const json = await response.json();
-            if (alive) { const up = json?.connected === true; setLinkUp(up); publishLink(up); }
+            if (alive) { const up = json?.connected === true; setLinkUp(up); publishLink(platformId, up); }
           } catch (err) {
             // 连插件都问不到 = 肯定不在线
-            if (alive) { setLinkUp(false); publishLink(false); }
+            if (alive) { setLinkUp(false); publishLink(platformId, false); }
           }
         };
         void probe();
         const timer = setInterval(() => { void probe(); }, 6000);
         return () => { alive = false; clearInterval(timer); };
-      }, []);
+      }, [platformId]);
 
       // 贴底逻辑：只有用户本来就在底部时才自动滚 —— 否则他正在往上翻，
       // 每次轮询都把他拽回底部会很难用。
@@ -1458,7 +1512,7 @@ window.__ModuleLoader__.load({
           const response = await fetch(CONTROL_BASE + '/send', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ text: value }),
+            body: JSON.stringify({ text: value, platform: platformId }),
           });
           const json = await response.json();
           if (json?.ok === false) setError(String(json.error ?? '发送失败'));
@@ -1488,21 +1542,21 @@ window.__ModuleLoader__.load({
 
       // ── 头部：头像 + 标题（连通时带绿灯）+ 状态 ──
       const head = h('div', { className: 'qqb-panel-head' },
-        h('div', { className: 'qqb-head-avatar' }, h(PenguinArt, { size: 28 })),
+        h('div', { className: 'qqb-head-avatar' }, h(Art, { size: 28 })),
         h('div', { className: 'qqb-head-text' },
           h('div', { className: 'qqb-panel-title-row' },
-            h('div', { className: 'qqb-panel-title' }, '奇怪的企鹅'),
+            h('div', { className: 'qqb-panel-title' }, platformTitle),
             // 绿灯只在**明确连通**时出现；不连通就完全不渲染（不是灰点）
             linkUp ? h('span', {
               className: 'qqb-online',
-              title: '已连通 QQ',
-              'aria-label': '已连通 QQ',
+              title: '已连通 ' + platformTitle,
+              'aria-label': '已连通 ' + platformTitle,
             }) : null),
           h('div', { className: 'qqb-panel-sub' },
             error !== '' ? '连接异常'
               : busy ? '正在处理你的消息…'
               : linkUp ? (messages.length === 0 ? '在线待命' : ('在线 · 最近 ' + messages.length + ' 条'))
-              : '未连通 QQ（去「设置 → 连接 QQ」看看）')),
+              : ('未连通 ' + platformTitle + '（' + ui.offlineHint + '）'))),
         h('div', { className: 'qqb-panel-spacer' }),
         error !== '' ? h('span', { className: 'qqb-badge err' }, error) : null,
         busy ? h('span', { className: 'qqb-badge busy' }, '处理中') : null,
@@ -1515,12 +1569,9 @@ window.__ModuleLoader__.load({
         h('div', { className: 'qqb-body-inner' },
         messages.length === 0
           ? h('div', { className: 'qqb-panel-empty' },
-              h('div', { className: 'qqb-empty-art' }, h(PenguinArt, { size: 96 })),
-              h('div', { className: 'qqb-empty-title' }, '这里是企鹅的窝'),
-              h('div', { className: 'qqb-empty-desc' },
-                '在手机 QQ 上给它发消息，它会在这台电脑上干活；',
-                h('br'),
-                '也可以直接在下面输入 —— 两条路走的是同一个大脑。'),
+              h('div', { className: 'qqb-empty-art' }, h(Art, { size: 96 })),
+              h('div', { className: 'qqb-empty-title' }, ui.emptyTitle),
+              h('div', { className: 'qqb-empty-desc' }, ui.emptyDesc),
               h('div', { className: 'qqb-empty-hint' },
                 data?.note !== undefined ? String(data.note) : ''))
           : messages.map((message, index) => {
@@ -1565,7 +1616,7 @@ window.__ModuleLoader__.load({
           h('textarea', {
             className: 'qqb-send-box',
             value: text,
-            placeholder: '让它干点什么…',
+            placeholder: ui.placeholder,
             onChange: (event) => setText(event.target.value),
             onKeyDown,
             rows: 1,
@@ -1584,7 +1635,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'qqb-panel-spacer' }),
           h('span', null, 'Ctrl + Enter 发送'),
           h('span', null, '·'),
-          h('span', null, '回答不推手机'))));
+          h('span', null, ui.note))));
 
       return h('div', { className: 'qqb-panel' }, head, body, foot);
     }
@@ -1823,13 +1874,15 @@ window.__ModuleLoader__.load({
         //     条目变化时自动重排图标列表
         // ⚠ 不要用"图标组件 return null"来隐藏：那样**行还在**，
         //   会留下一个空图标 + 文字的按钮。必须真注册 / 真注销。
-        const wireDynamicPlatforms = (makeOptions, makeComponent) => {
+        //
+        // `pickMetas` 决定"哪些平台走动态注册"（默认全部 —— 但 QQ/微信已被静态注册，
+        // 所以调用方会传一个排除它们的清单，避免同一 key 注册两次）。
+        const wireDynamicPlatforms = (makeOptions, makeComponent, pickMetas = () => PLATFORMS) => {
           const disposers = new Map();   // 平台 id → dispose
           let stopped = false;
 
           const sync = (enabled) => {
-            for (const meta of PLATFORMS) {
-              if (meta.id === 'qq') continue;          // 企鹅已静态注册
+            for (const meta of pickMetas()) {
               const on = enabled[meta.id] === true;
               const has = disposers.has(meta.id);
               if (on && !has) {
@@ -1876,34 +1929,48 @@ window.__ModuleLoader__.load({
         //   "Global panel icons. Each list id addresses the matching main panel"
         // 所以 sidebar.panellist 的 id 必须和 main 的 key **一致**（都用 <平台>-panel）。
         //
-        // 企鹅（QQ）**静态注册**：它是唯一已实现的传输层，必须一直在。
+        // QQ 与微信**都静态注册**：这两个平台的传输层已实现（能收能发能接 agent），
         //   入口和功能同生共死 —— 禁用插件时图标和面板一起消失，
         //   不会出现"插件没了但图标还在、点了是空白"。
-        // 其余四个平台**动态注册**：开关状态在宿主（设置页改），这边每 5 秒对齐一次。
+        //   ⚠ 微信原来是**动态注册**（跟其余三个"只收不发"的平台一起），
+        //     于是面板用的是占位壳（`makePlatformPanel`）——
+        //     用户点进去看到"传输层未接入"，而它其实早就通了（2026-10-08 修）。
+        // 其余三个平台（企微/飞书/钉钉）**动态注册**：
+        //   它们出站未实现，开关状态在宿主（设置页改），这边每 5 秒对齐一次。
+        const staticIds = ['qq', 'weixin'];
+        const staticMetas = () => PLATFORMS.filter((p) => staticIds.includes(p.id));
+        const dynamicMetas = () => PLATFORMS.filter((p) => !staticIds.includes(p.id));
+
         ctx.slots.inject('sidebar.panellist', () => {
-          const disposeQq = ctx.slots.register({
+          const disposers = staticMetas().map((meta) => ctx.slots.register({
             name: 'sidebar.panellist',
-            id: 'qq-panel',
-            order: 20,
-            label: () => '奇怪的企鹅',
-          }, PenguinIcon);
+            id: meta.panelId,
+            order: meta.order,
+            label: () => meta.title,
+          }, makePlatformIcon(meta)));
           const disposeOthers = wireDynamicPlatforms(
             (meta) => ({ name: 'sidebar.panellist', id: meta.panelId, order: meta.order, label: () => meta.title }),
             (meta) => makePlatformIcon(meta),
+            dynamicMetas,
           );
-          return () => { disposeOthers(); disposeQq(); };
+          return () => { disposeOthers(); for (const d of disposers) d(); };
         });
 
         ctx.slots.inject('main', () => {
-          const disposeQq = ctx.slots.register({
+          // ⚠ 用 `.bind(null, meta)` 把平台元数据喂给**同一份**面板实现。
+          //   为什么不用 `makeLivePanel(meta)` 工厂：那需要把整个函数体再缩进一层，
+          //   而在这个近 2000 行的文件上做批量缩进风险明显更高（我因此毁过一次文件，
+          //   靠 git checkout 才恢复）。bind 得到的效果一样、改动面小得多。
+          const disposers = staticMetas().map((meta) => ctx.slots.register({
             name: 'main',
-            key: 'qq-panel',
-          }, QqPanel);
+            key: meta.panelId,
+          }, QqPanel.bind(null, meta)));
           const disposeOthers = wireDynamicPlatforms(
             (meta) => ({ name: 'main', key: meta.panelId }),
             (meta) => makePlatformPanel(meta),
+            dynamicMetas,
           );
-          return () => { disposeOthers(); disposeQq(); };
+          return () => { disposeOthers(); for (const d of disposers) d(); };
         });
       },
     };
