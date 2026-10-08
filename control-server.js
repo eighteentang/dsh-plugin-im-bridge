@@ -210,10 +210,15 @@ export function startStatusServer({ log, getMessages, sendToAgent, listModels, s
     // 为什么需要它：设置页原来的输入框初值只来自浏览器 localStorage，
     // 而真正的凭据在宿主这边 —— 两个真相来源，界面会骗人。
     // 这个端点让界面以宿主为准。
+    //
+    // ⚠ `id` 参数（2026-10-08 加）：原来只查 QQ。现在每个平台那一行都要
+    //   显示自己的"已保存 / 还没填"，所以必须能按平台查。
+    //   不传 `id` 时保持原行为（查 QQ），向后兼容。
     if (url.pathname === '/im-bridge/credential' && req.method === 'GET') {
+      const credentialId = String(url.searchParams.get('id') ?? 'qq').trim() || 'qq';
       void (async () => {
         try {
-          const payload = await getCredential?.();
+          const payload = await getCredential?.(credentialId);
           res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify(payload ?? { configured: false, reason: 'no-handler' }));
         } catch (error) {

@@ -99,6 +99,28 @@ const PLATFORM_CREDENTIAL_KEYS = {
   wecom: 'im-bridge/wecom',
 };
 
+/**
+ * 每个平台的凭据字段名，分"非密"与"密"两类。
+ *
+ * ⚠ 为什么要把这个列出来（2026-10-08 加）：`getCredentialInfo` 要判断
+ *   "配全了没有"，而各平台的字段名完全不同。原来那段是**写死 QQ 的**
+ *   （`QQ_BOT_APPID` / `QQ_BOT_SECRET`）——于是别的平台查自己的凭据时，
+ *   拿到的永远是"没配"。
+ *
+ *   列成表之后，加一个平台只改**这一处**，不用再动查询逻辑
+ *   （经验库 E19：把规则变成结构，而不是散在各处的 if）。
+ *
+ * 顺序有意义：`plain[0]` 用来做"尾 4 位"显示（各平台都拿第一个非密字段当身份）。
+ */
+const PLATFORM_CREDENTIAL_FIELDS = {
+  qq: { plain: ['QQ_BOT_APPID'], secret: ['QQ_BOT_SECRET'] },
+  // 微信走扫码换 bot_token，没有静态凭据
+  weixin: { plain: [], secret: [] },
+  feishu: { plain: ['FEISHU_APP_ID'], secret: ['FEISHU_APP_SECRET'] },
+  dingtalk: { plain: ['DINGTALK_CLIENT_ID', 'DINGTALK_ROBOT_CODE'], secret: ['DINGTALK_CLIENT_SECRET'] },
+  wecom: { plain: ['WECOM_BOT_ID'], secret: ['WECOM_BOT_SECRET'] },
+};
+
 const PLATFORMS_FILE = join(STATUS_DIR, 'im-bridge-platforms.json');
 
 /** 默认：QQ 开（现状），其余关（传输层还没接）。 */
@@ -1503,6 +1525,18 @@ export function apply(ctx, config = {}) {
   }
 
   // ---- 凭据：从 credentials 服务读取记录
+  /**
+   * 读 QQ 的连接凭据（`{ appId, appSecret }`）。
+   *
+   * ⚠ **这个函数有意是 QQ 专用的**（2026-10-08 核对过）：
+   *   · 只有 QQ 的 `restartConnection` 用它，返回值就是 QQ 客户端的两个入参
+   *   · 其它平台的凭据由各自的 `testPlatform` 分支通过 `readPlatformEnv(id)` 读
+   *   · 而"设置页要看的凭据状态"走 `getCredentialInfo(id)` —— 那个是**通用**的
+   *
+   *   所以这里出现 `QQ_BOT_*` 字段名不是漏改，是它的职责本来就是"给 QQ 客户端备料"。
+   *   （判断依据：一个函数里出现平台专属字段名**没错**，错的是"本该通用却写死"。
+   *     `getCredentialInfo` 原来就是后者，已改成按平台。）
+   */
   async function readCredential() {
     try {
       const record = await ctx.credentials.readRecord(CREDENTIAL_KEY);
@@ -1530,29 +1564,44 @@ export function apply(ctx, config = {}) {
    *
    * 修法：界面以**宿主为准**。这个函数就是那个"宿主的事实"。
    *
-   * ⚠ **绝不返回 secret** —— 凭据不是配置，能拿它去调 QQ 的 API。
-   *   只报三件事：配没配、AppID 的尾 4 位（够人认出来是哪一份）、以及从哪读到的。
+   * ⚠ `id` 参数（2026-10-08 加）：原来只支持 QQ。现在每个平台那一行
+   *   都要显示自己的"已保存 / 还没填"，所以必须能按平台查。
+   *   不传时默认 qq，向后兼容。
+   *
+   * ⚠ **绝不返回 secret** —— 凭据不是配置，能拿它去调平台 API。
+   *   只报：配没配、每个非密字段的长度与尾 4 位、以及从哪读到的。
    */
-  async function getCredentialInfo() {
+  async function getCredentialInfo(id = 'qq') {
     try {
-      const record = await ctx.credentials.readRecord(CREDENTIAL_KEY);
-      if (record === undefined) return { configured: false, reason: 'no-record' };
-      if (record.kind !== 'api-key') return { configured: false, reason: `unexpected-kind:${record.kind}` };
-
-      const env = record.env ?? {};
-      const appId = String(env.QQ_BOT_APPID ?? record.key ?? '').trim();
-      const secret = String(env.QQ_BOT_SECRET ?? '').trim();
-      if (appId === '' || secret === '') {
-        return { configured: false, reason: 'incomplete', hasAppId: appId !== '', hasSecret: secret !== '' };
+      if (!PLATFORM_IDS.includes(id)) {
+        return { configured: false, reason: `unknown-platform:${String(id)}` };
       }
+      const env = await readPlatformEnv(id);
+      const fields = PLATFORM_CREDENTIAL_FIELDS[id] ?? { plain: [], secret: [] };
+
+      // 缺失判据：**所有**非密字段 + **所有**密字段都得有值。
+      //   不逐个平台写 if —— 那样每加一个平台就要改这个函数（E19：把规则变成结构）。
+      const missing = [
+        ...fields.plain.filter((key) => String(env[key] ?? '').trim() === ''),
+        ...fields.secret.filter((key) => String(env[key] ?? '').trim() === ''),
+      ];
+      if (missing.length > 0) {
+        return {
+          configured: false,
+          reason: Object.keys(env).length === 0 ? 'no-record' : 'incomplete',
+          missing,
+        };
+      }
+
+      const first = String(env[fields.plain[0]] ?? '').trim();
       return {
         configured: true,
-        // 只给尾 4 位：够确认"是哪一份"，但不足以拼出完整 AppID
-        appIdTail: appId.length > 4 ? appId.slice(-4) : appId,
-        appIdLength: appId.length,
         hasSecret: true,
+        // 只给尾 4 位 + 长度：够确认"是哪一份"，但不足以拼出完整凭据
+        appIdTail: first.length > 4 ? first.slice(-4) : first,
+        appIdLength: first.length,
         // 当前连接状态也一起给它 —— 界面能在一处说清"配好了"和"连上了"
-        connected: qq !== null,
+        connected: getPlatformRuntime(id)?.phase === 'connected',
       };
     } catch (error) {
       return { configured: false, reason: 'read-failed', message: String(error?.message ?? error).slice(0, 120) };

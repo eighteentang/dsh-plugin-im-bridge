@@ -453,6 +453,30 @@ window.__ModuleLoader__.load({
       const [busyId, setBusyId] = React.useState('');      // 正在保存/测试哪个平台
       const [results, setResults] = React.useState({});    // id -> { kind, text }
       const [qrUrl, setQrUrl] = React.useState('');        // 微信扫码链接
+      /**
+       * id -> 宿主侧凭据状态（2026-10-08 加）。
+       *
+       * ⚠ 三态，不能混成两态（这是原来那个"凭据消失"bug 的根因）：
+       *   undefined = 还没查（探测中）
+       *   {configured:true}  = 宿主里真的配好了
+       *   {configured:false} = 宿主里确实没有
+       * 曾经的做法是"输入框为空就当没配" —— 而输入框初值来自浏览器
+       * localStorage，清了就是空，于是**已配好的也显示成空白**。
+       */
+      const [creds, setCreds] = React.useState({});
+
+      /** 查某个平台在**宿主**里的凭据状态（只有需要静态凭据的平台才查） */
+      const probeCred = React.useCallback(async (id) => {
+        try {
+          const r = await fetch(`${CONTROL_BASE}/credential?id=` + encodeURIComponent(id));
+          if (!r.ok) { setCreds((prev) => ({ ...prev, [id]: { configured: false, reason: `http-${r.status}` } })); return; }
+          const json = await r.json();
+          setCreds((prev) => ({ ...prev, [id]: json }));
+        } catch (error) {
+          // 探测失败 ≠ 没配置。分开报，避免把"问不到"说成"没配"。
+          setCreds((prev) => ({ ...prev, [id]: { configured: false, reason: 'probe-failed', message: String(error?.message ?? error) } }));
+        }
+      }, []);
 
       const load = React.useCallback(async () => {
         try {
@@ -544,6 +568,9 @@ window.__ModuleLoader__.load({
               [meta.id]: { kind: tested?.ok === true ? 'ok' : 'err', text: String(tested?.message ?? '') },
             }));
           }
+          // 保存过就重新查一次凭据状态 —— 让"凭据已存"那个标记立刻变真，
+          // 而不是等用户下次展开才更新（那样会让人以为没保存成功）
+          if (fields.length > 0) void probeCred(meta.id);
           void load();
         } catch (error) {
           setResults((prev) => ({ ...prev, [meta.id]: { kind: 'err', text: '连不上插件（Host 侧没在跑？）' } }));
@@ -577,6 +604,10 @@ window.__ModuleLoader__.load({
         //   （这个 const 必须在下面的 h(...) **外面** —— 参数位置是表达式，不能声明变量）
         const phaseText = on === false ? '已关闭' : (PHASE_TEXT[phase] ?? phase);
 
+        // 凭据状态（只有需要静态凭据的平台才有意义；微信是扫码，不需要）
+        const needsCred = (PLATFORM_FIELDS[meta.id] ?? []).length > 0;
+        const cred = creds[meta.id];
+
         const head = h('div', {
           key: 'head',
           style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 0' },
@@ -600,7 +631,29 @@ window.__ModuleLoader__.load({
                 : 'var(--dsw-alias-state-warn-primary)',
               whiteSpace: 'nowrap',
             },
-          }, meta.maturity === 'full' ? '可用' : '部分')),
+          }, meta.maturity === 'full' ? '可用' : '部分'),
+          /**
+           * 「凭据」标记 —— 折叠状态下就能看出"填过没有"。
+           *
+           * ⚠ 为什么要有它（2026-10-08）：原来凭据状态（"凭据已保存"）是
+           *   一个**独立的区块**，跟平台开关平级 —— 于是同一个 QQ 被拆到页面两处。
+           *   现在合进这一行：折叠时看标记，展开时看字段，
+           *   其它平台本来就是这个形态，QQ 跟上即可。
+           *
+           * 三态都用不同说法，不能混：
+           *   undefined（还没查）→ 不显示，避免闪一下"未填"
+           *   configured:false    → 「未填凭据」（这才是要人动手的）
+           *   configured:true     → 「凭据已存」（不用再动，除非要换）
+           */
+          !needsCred ? null : h('span', {
+            style: {
+              marginLeft: 6,
+              fontSize: 10,
+              color: cred?.configured === true
+                ? 'var(--dsw-alias-state-success-primary)'
+                : 'var(--dsw-alias-label-secondary)',
+            },
+          }, cred === undefined ? '' : (cred.configured === true ? '· 凭据已存' : '· 未填凭据')),
         // ⚠ 开关关着的平台不该显示"未连接" —— 那读起来像出错，
         //   而它其实是"你主动关的，没有任何问题"。所以先看开关。
         h('span', {
@@ -628,8 +681,14 @@ window.__ModuleLoader__.load({
         h('button', {
           className: 'qqb-btn qqb-btn-ghost',
           type: 'button',
-          onClick: () => setOpenId(expanded ? '' : meta.id),
-        }, expanded ? '收起' : '配置/测试'));
+          onClick: () => {
+            const next = expanded ? '' : meta.id;
+            setOpenId(next);
+            // 展开时查一次这个平台的**宿主侧**凭据状态 ——
+            // 判据必须来自宿主（输入框永远不回显，不能拿它当依据）
+            if (next !== '' && needsCred) void probeCred(next);
+          },
+        }, expanded ? '收起' : '配置/测试')));
 
         if (!expanded) return h('div', { key: meta.id }, head);
 
@@ -651,6 +710,35 @@ window.__ModuleLoader__.load({
           style: { padding: '6px 0 10px 26px', display: 'flex', flexDirection: 'column', gap: 8 },
         },
         guideNode,
+        /**
+         * 凭据状态 —— 展开时先告诉用户"存过没有"，再给输入框。
+         *
+         * ⚠ 为什么必须有这一行（2026-10-08）：输入框**永远不回显**
+         *   （凭据存宿主、界面不显示明文），所以已配好的用户展开后
+         *   会看到一片空白，以为丢了 —— 这正是 2026-10-07 那个
+         *   "设置页里凭据消失"的反馈。判据必须来自宿主，不是输入框空不空。
+         */
+        !needsCred ? null : (() => {
+          if (cred === undefined) return h('div', { className: 'qqb-note' }, '正在读取本机凭据状态…');
+          const probeFailed = cred?.reason === 'probe-failed' || String(cred?.reason ?? '').startsWith('http-');
+          if (probeFailed) {
+            return h('div', { className: 'qqb-status err' },
+              '读不到本机的凭据状态（Host 侧接口没响应）。下面输入框里是浏览器记着的值，不代表宿主里有没有。');
+          }
+          if (cred.configured === true) {
+            return h('div', { className: 'qqb-saved' },
+              h('div', { className: 'qqb-saved-head' },
+                h('span', { className: 'qqb-saved-dot' }),
+                h('strong', null, '凭据已保存在本机'),
+                cred.connected === true ? h('span', { className: 'qqb-saved-ok' }, '已连接') : null),
+              h('div', { className: 'qqb-saved-line' },
+                `识别码尾号 ${cred.appIdTail ?? '????'}（共 ${cred.appIdLength ?? '?'} 位）· 密钥已保存`),
+              h('div', { className: 'qqb-saved-hint' },
+                '界面不回显密钥 —— 这是有意的。想换一份就在下面重填，留空则保持原样。'));
+          }
+          return h('div', { className: 'qqb-note' },
+            '本机还没有这个平台的凭据 —— 在下面填好，再点「保存并连接」。');
+        })(),
         fields.length === 0
           ? h('div', { className: 'qqb-note' },
               meta.id === 'weixin'
@@ -823,175 +911,40 @@ window.__ModuleLoader__.load({
         }, logLines.slice(-60).join('\n')));
     }
 
-    /** 设置页：连接 QQ */
+    /**
+     * 设置页：连接 IM
+     *
+     * ⚠ 2026-10-08 大改：这个组件**不再自己管 QQ 凭据**了。
+     *
+     *   原来这里是"状态 + 平台开关 + 可选组件 + **独立的 QQ 凭据区** + 脚注"，
+     *   而 QQ 凭据区又和平台列表里 QQ 那一行的展开表单**是同一件事** ——
+     *   更糟的是两边键名还不一样：
+     *     旧的独立区：`appId` / `appSecret`（走浏览器 localStorage）
+     *     平台行内  ：`QQ_BOT_APPID` / `QQ_BOT_SECRET`（走宿主凭据存储）
+     *   于是用户看到同一个 QQ 被拆到页面两处，而且两处不联动 —— 这就是"乱"。
+     *
+     *   现在凭据只在**平台那一行**里管（和飞书/钉钉/企微完全一致的形态），
+     *   这个组件只负责摆好四件事：状态、平台列表、可选组件、脚注。
+     *   所以它自己没有任何 state —— 每个区块自己取数据、自己刷新。
+     */
     function QqBridgeSettings() {
       ensureStyle();
-      const [form, setForm] = React.useState(() => loadConfig());
-      const [status, setStatus] = React.useState(null);
-      const [busy, setBusy] = React.useState(false);
-
-      const update = (key) => (event) => setForm((prev) => ({ ...prev, [key]: event.target.value }));
-
-      /**
-       * 凭据在**宿主**里的真实状态。
-       *
-       * ⚠ 三种状态，不能混成两种（这是这次修 bug 的核心）：
-       *   null       = 还没查到（探测中）
-       *   {configured:true}  = 宿主里配好了 → 显示"已保存"，不显示输入框
-       *   {configured:false} = 宿主里确实没有 → 显示输入框
-       *
-       *   曾经的做法是"输入框为空就当没配" —— 而输入框初值来自浏览器
-       *   localStorage，清了就是空。于是**已配好的也会显示成空白**，
-       *   界面在骗人（用户 2026-10-07 报的"设置页里凭据消失"）。
-       */
-      const [cred, setCred] = React.useState(null);
-      const [editing, setEditing] = React.useState(false);
-
-      const probeCredential = React.useCallback(async () => {
-        try {
-          const r = await fetch(`${CONTROL_BASE}/credential`);
-          if (!r.ok) { setCred({ configured: false, reason: `http-${r.status}` }); return; }
-          setCred(await r.json());
-        } catch (error) {
-          // 探测失败 ≠ 没配置。分开报，避免把"问不到"说成"没配"。
-          setCred({ configured: false, reason: 'probe-failed', message: String(error?.message ?? error) });
-        }
-      }, []);
-
-      React.useEffect(() => { void probeCredential(); }, [probeCredential]);
-
-      /** 凭据区：宿主说配好了就展示状态，否则显示输入框 */
-      const credentialSection = () => {
-        const known = cred !== null;
-        const configured = cred?.configured === true;
-        const probeFailed = cred?.reason === 'probe-failed' || String(cred?.reason ?? '').startsWith('http-');
-
-        // 已配置 且 没点"重新设置" → 只显示状态，不显示输入框
-        if (known && configured && !editing) {
-          return h('div', { className: 'qqb-saved' },
-            h('div', { className: 'qqb-saved-head' },
-              h('span', { className: 'qqb-saved-dot' }),
-              h('strong', null, '凭据已保存'),
-              cred.connected === true ? h('span', { className: 'qqb-saved-ok' }, '已连接') : null),
-            h('div', { className: 'qqb-saved-line' },
-              `AppID 尾号 ${cred.appIdTail ?? '????'}（共 ${cred.appIdLength ?? '?'} 位）· AppSecret 已保存`),
-            h('div', { className: 'qqb-saved-hint' },
-              '凭据存在本机，界面不回显 —— 这是有意的（它是能调 QQ 接口的密钥）。'),
-            h('div', { className: 'qqb-actions' },
-              h('button', {
-                className: 'qqb-btn qqb-btn-ghost',
-                onClick: () => { setEditing(true); setStatus(null); },
-              }, '重新设置')));
-        }
-
-        return h('div', null,
-          // 还没查到 → 说明在探测，不要急着显示空表单
-          !known ? h('div', { className: 'qqb-note' }, '正在读取本机凭据状态…') : null,
-          // 探测失败 → 说清是"问不到"，不是"没配"
-          probeFailed ? h('div', { className: 'qqb-status err' },
-            '读不到本机的凭据状态（Host 侧接口没响应）。下面的输入框只反映浏览器里记着的值，不代表宿主里有没有。') : null,
-          h('div', { className: 'qqb-row' },
-            h('label', null, 'AppID'),
-            h('input', {
-              value: form.appId ?? '',
-              onChange: update('appId'),
-              placeholder: '在 q.qq.com/qqbot/dashboard 的「开发设置」里',
-              spellCheck: false,
-            })),
-          h('div', { className: 'qqb-row' },
-            h('label', null, 'AppSecret'),
-            h('input', {
-              value: form.appSecret ?? '',
-              onChange: update('appSecret'),
-              placeholder: '同一页面，注意不要外传',
-              type: 'password',
-              spellCheck: false,
-            })),
-          h('div', { className: 'qqb-actions' },
-            h('button', { className: 'qqb-btn', onClick: connect, disabled: busy || !known },
-              busy ? '连接中…' : '连接 QQ'),
-            // 从"已保存"点进来时给一条退路，否则用户被困在编辑态
-            known && configured && editing
-              ? h('button', {
-                  className: 'qqb-btn qqb-btn-ghost',
-                  onClick: () => { setEditing(false); setStatus(null); },
-                }, '取消')
-              : null));
-      };
-
-      const connect = async () => {
-        setBusy(true);
-        setStatus({ kind: 'note', text: '正在保存…' });
-        try {
-          const appId = String(form.appId ?? '').trim();
-          const appSecret = String(form.appSecret ?? '').trim();
-          const sandbox = form.sandbox !== false;
-          if (appId === '' || appSecret === '') {
-            setStatus({ kind: 'err', text: 'AppID 和 AppSecret 都要填。' });
-            return;
-          }
-
-          // 写进 Host 的凭据存储：记录形如
-          //   { kind: 'api-key', env: { QQ_BOT_APPID, QQ_BOT_SECRET } }
-          // Host 侧插件监听 'credentials/record-updated'，收到就自动重连。
-          // ⚠ 这里原来走 `ctx?.remote?.credentials` —— **那是坏的**（已确认）：
-          //   `factory(require)` 里没有绑定 `ctx`，而对**未声明**的标识符，
-          //   可选链 `ctx?.x` 照样抛 ReferenceError，又被 catch 吞掉。
-          //   结果：点「连接 QQ」永远提示"没写进 Host 凭据存储"，静默失败。
-          //   现在改成让宿主写（POST /credential），宿主写完会**回读确认**。
-          let written = false;
-          let saveError = '';
-          try {
-            const saved = await (await fetch(`${CONTROL_BASE}/credential`, {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ id: 'qq', env: { QQ_BOT_APPID: appId, QQ_BOT_SECRET: appSecret } }),
-            })).json();
-            written = saved?.ok === true;
-            if (written !== true) saveError = String(saved?.message ?? '');
-          } catch (error) {
-            saveError = String(error?.message ?? error);
-          }
-
-          saveConfig({ appId, appSecret, sandbox });
-
-          // 保存后重新探测宿主状态 —— 让界面立刻反映"真的存进去了"
-          // （不是靠 saveConfig 成功就假定宿主也成功了，那正是原来骗人的根源）
-          await probeCredential();
-
-          if (written) {
-            // 存进去了 → 退出编辑态，回到"已保存"展示
-            setEditing(false);
-            // 输入框里的 secret 也清掉：界面不该长期留着一份明文密钥
-            setForm((prev) => ({ ...prev, appSecret: '' }));
-            setStatus({ kind: 'ok', text: '已保存到本机。Host 侧正在连接 QQ，稍候在手机 QQ 里给机器人发一条消息试试。' });
-          } else {
-            setStatus({
-              kind: 'err',
-              text: saveError === ''
-                ? '没写进 Host 凭据存储（原因未知）—— 插件不会用它连接，请看 Host 日志。'
-                : `没写进 Host 凭据存储：${saveError}`,
-            });
-          }
-        } catch (error) {
-          setStatus({ kind: 'err', text: `失败：${error?.message ?? error}` });
-        } finally {
-          setBusy(false);
-        }
-      };
 
       return h('div', { className: 'qqb-wrap' },
         // ① 状态放最上面 —— 打开设置第一眼就知道"能用了没有"
         h(StatusPanel, null),
-        // ①′ 平台开关 —— 决定左侧边栏出现哪几个入口（不需要重启）
+        // ② 平台列表 —— **这一页的主干**：每个平台一行，
+        //    行内有开关、完成度、连接状态、凭据状态；展开后填凭据 / 测连接。
+        //
+        //    ⚠ 这里原来后面还跟着一个独立的 QQ 凭据区（credentialSection）——
+        //    2026-10-08 去掉了。它和行内表单是**同一件事的两处界面**，
+        //    而且键名还不一样（那边 `appId/appSecret` 走 localStorage，
+        //    这边 `QQ_BOT_APPID/SECRET` 走宿主凭据存储）——
+        //    用户看到同一个 QQ 被拆到页面两处，这就是"乱"的来源。
         h(PlatformToggles, null),
-        // ①″ 可选组件 —— 重 SDK 的安装 / 卸载（体积写在按钮旁，装了能回收空间）
+        // ③ 可选组件 —— 重 SDK 的安装 / 卸载（体积写在按钮旁，装了能回收空间）
         h(ComponentSection, null),
-        // ② 凭据区：**以宿主为准**（不再把空输入框当"没配"）
-        credentialSection(),
-        status === null ? null : h('div', {
-          className: `qqb-status ${status.kind === 'ok' ? 'ok' : status.kind === 'err' ? 'err' : ''}`,
-        }, status.text),
+        // ④ 脚注：连接前的两件准备 + 凭据存放说明
         h('div', { className: 'qqb-note' },
           '连接前请先在两处做好准备：',
           h('br'),
@@ -999,7 +952,7 @@ window.__ModuleLoader__.load({
           h('br'),
           '② 家用宽带没有固定公网 IP，正式环境的 IP 白名单过不去，所以连接默认走沙箱环境。'),
         h('div', { className: 'qqb-hint' },
-          '说明：凭据保存在本机；与 QQ 的通信由 Host 侧插件负责（浏览器直连会被 CORS 拦）。'));
+          '说明：凭据保存在本机；与各平台的通信由 Host 侧插件负责（浏览器直连会被 CORS 拦）。'));
     }
 
     /**
