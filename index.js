@@ -2776,6 +2776,59 @@ export function apply(ctx, config = {}) {
     }
   });
 
+  /**
+   * 启动时把**已启用**的平台恢复起来（2026-10-08 加）。
+   *
+   * ── 为什么必须有它（这是一次实测的真故障）──────────────────────────
+   * 原来启动路径**只连 QQ**（`restartConnection('启动')`），其它平台要用户
+   * 手动去设置页点「测试连接」才会起来。于是出现这个极难自查的现象：
+   *
+   *     用户重启客户端 → 在微信里发消息 → 「没反应」
+   *     日志里：qq-event READY（QQ 连上了），**之后一行 weixin 都没有**
+   *
+   * 消息根本没进插件。而用户会以为"接 agent 又坏了"。
+   *
+   * ── 为什么只自动恢复微信 ────────────────────────────────────────
+   *   · 微信用 bot_token，**存在本机**（`im-bridge-weixin.json`）→
+   *     可以直接起长轮询，**不用再扫码**，所以恢复是无副作用的
+   *   · 企微/钉钉/飞书虽然有凭据，但**出站没实现**（发不回去）。
+   *     自动连上只会让界面显示"已连接"却依然不能用 —— 那比不连更误导。
+   *     所以这里**只自动恢复"能双向收发"的平台**，其余留给用户手动点
+   *     （设置页里已经如实标注了各平台的完成度）。
+   *
+   * 失败只记日志、不抛 —— 自动恢复失败不该影响插件加载（QQ 已经在正常跑了）。
+   */
+  function autoResumePlatforms() {
+    const resumed = [];
+    if (platformState.weixin === true) {
+      const token = readWeixinToken();
+      if (token !== null) {
+        try {
+          startWeixinWithLoop(token);
+          resumed.push('weixin');
+        } catch (error) {
+          recordStatus('platform-autoresume-failed', { id: 'weixin', message: describeError(error) });
+        }
+      } else {
+        // 启用了但没凭据 —— 记一条，否则用户只会看到"微信没反应"
+        recordStatus('platform-autoresume-skipped', {
+          id: 'weixin',
+          reason: '本机没有存盘的 bot_token —— 需要在设置页扫码一次',
+        });
+      }
+    }
+    const notResumed = PLATFORM_IDS.filter(
+      (id) => id !== 'qq' && id !== 'weixin' && platformState[id] === true,
+    );
+    if (notResumed.length > 0) {
+      recordStatus('platform-autoresume-skipped', {
+        ids: notResumed,
+        reason: '这些平台的出站还没实现（发不回去），自动连接会误导 —— 请手动点「测试连接」',
+      });
+    }
+    return resumed;
+  }
+
   // ---- 启动：先按已有凭据尝试连接
   recordStatus('plugin-applied', {
     version: '1.0.0',
@@ -2793,6 +2846,12 @@ export function apply(ctx, config = {}) {
   void (async () => {
     await migrateCredentialKey();
     await restartConnection('启动');
+    // ⚠ 再恢复其它**已启用且能双向收发**的平台（目前是微信）。
+    //   放在 QQ 之后：QQ 是主通道，先让它起来；恢复别的失败也不影响它。
+    //   没有这一步的话，用户重启客户端后微信通道是**死的** ——
+    //   表现是"发了消息没反应"，而日志里连一条 weixin 事件都没有（实测踩过）。
+    const resumed = autoResumePlatforms();
+    recordStatus('platforms-autoresumed', { resumed });
   })().catch((error) => {
     log(`启动连接失败：${error.message}`);
     recordStatus('startup-error', { message: error.message });
