@@ -598,10 +598,24 @@ window.__ModuleLoader__.load({
 
         if (!expanded) return h('div', { key: meta.id }, head);
 
+        // 开通指引 —— 放在最上面：先把"去哪拿凭据"说清，再让人填
+        const guide = PLATFORM_GUIDE[meta.id] ?? null;
+        const guideNode = guide === null ? null : h('div', {
+          key: 'guide',
+          className: 'qqb-note',
+          style: { display: 'flex', flexDirection: 'column', gap: 4, paddingBottom: 2 },
+        },
+        h('div', null, h('strong', null, guide.title)),
+        ...guide.steps.map((step, index) => h('div', { key: `step-${index}` }, `${index + 1}. ${step}`)),
+        guide.link === undefined ? null : h('div', null,
+          h('a', { href: guide.link.href, target: '_blank', rel: 'noreferrer' }, guide.link.label)),
+        guide.note === undefined ? null : h('div', { style: { opacity: 0.85, marginTop: 2 } }, guide.note));
+
         const detail = h('div', {
           key: 'body',
           style: { padding: '6px 0 10px 26px', display: 'flex', flexDirection: 'column', gap: 8 },
         },
+        guideNode,
         fields.length === 0
           ? h('div', { className: 'qqb-note' },
               meta.id === 'weixin'
@@ -993,6 +1007,72 @@ window.__ModuleLoader__.load({
         { key: 'WECOM_BOT_ID', label: '机器人 ID（bot_id）', placeholder: '企业微信后台 → 应用管理 → 智能机器人' },
         { key: 'WECOM_BOT_SECRET', label: 'Secret', secret: true },
       ],
+    };
+
+    /**
+     * 每个平台的**开通指引** —— 直接写在设置页里。
+     *
+     * 为什么必须有：这些凭据分散在四家后台，入口各不相同，而且每家的
+     * **坑**都不一样（QQ 要加沙箱白名单、飞书要企业、钉钉要组织授权、
+     * 企微只能内部成员）。让用户去别处查文档，等于把"点了没反应"
+     * 变成他自己要排查的问题。
+     *
+     * 写法约定：
+     *   · steps —— 可照做的编号步骤，每条一句话，**带具体路径**
+     *   · link  —— 该去哪（可点击）
+     *   · note  —— 最容易踩的坑，以及这一步**做不到什么**（别让人误以为连上就万事大吉）
+     */
+    const PLATFORM_GUIDE = {
+      qq: {
+        title: '凭据从哪来',
+        steps: [
+          '打开 q.qq.com，用 QQ 登录，创建机器人应用（需要实名认证）',
+          '进机器人后台 →「开发设置」，复制 AppID 和 AppSecret',
+          '⚠ 再到「沙箱配置」→「消息列表单聊」，**把你自己的 QQ 号加进去** —— 不加的话机器人收不到任何消息，而且不报错',
+        ],
+        link: { href: 'https://q.qq.com', label: 'q.qq.com（QQ 机器人后台）' },
+        note: '家用宽带没有固定公网 IP，正式环境的 IP 白名单过不去，所以默认走沙箱环境 —— 自己用完全够。',
+      },
+      weixin: {
+        title: '怎么连（不用申请任何凭据）',
+        steps: [
+          '手机微信升到 8.0.70 或更高',
+          '微信 →「我」→「设置」→「插件」，确认能看到「微信 ClawBot」',
+          '回到这里点「保存并测试连接」，会出现一个二维码链接 —— 用手机微信扫码',
+        ],
+        note: '二维码 5 分钟内有效。扫过之后 bot_token 存在本机，重启客户端不用重扫。若扫码没反应，先回手机那个插件页确认它已启用。',
+      },
+      feishu: {
+        title: '凭据从哪来',
+        steps: [
+          '打开 open.feishu.cn，进入「开发者后台」',
+          '创建「**企业自建应用**」（个人可以先自建一个飞书企业来测试）',
+          '进应用 →「凭证与基础信息」，复制 App ID 和 App Secret',
+        ],
+        link: { href: 'https://open.feishu.cn/app', label: 'open.feishu.cn（飞书开发者后台）' },
+        note: '⚠ 这一步**只验证凭据可用**，不代表能收消息。真正收消息还要在「事件与回调 → 事件配置」里切换成「使用长连接接收事件」—— 而那个操作保存时**必须已有客户端在线**，属于下一步接传输层的事。',
+      },
+      dingtalk: {
+        title: '凭据从哪来',
+        steps: [
+          '打开 open.dingtalk.com，进入「开发者后台」',
+          '创建「**企业内部应用**」—— 需要钉钉组织；开发者权限由组织管理员在 OA 管理后台授予',
+          '进应用 →「应用信息」，复制 Client ID（AppKey）和 Client Secret（AppSecret）',
+          'RobotCode 在机器人配置里，**发消息时才用得上**，现在可以先留空',
+        ],
+        link: { href: 'https://open-dev.dingtalk.com', label: 'open.dingtalk.com（钉钉开发者后台）' },
+        note: '⚠ 标准版有配额：单应用 20 QPS，且组织内所有企业内部应用**合计 10000 次/自然月**。别把「测试连接」当心跳反复点。',
+      },
+      wecom: {
+        title: '凭据从哪来',
+        steps: [
+          '打开 work.weixin.qq.com 管理后台（个人可以免费注册一个企业）',
+          '「应用管理」→ 创建「**智能机器人**」',
+          '在机器人详情页复制 机器人 ID（bot_id）和 Secret',
+        ],
+        link: { href: 'https://work.weixin.qq.com', label: 'work.weixin.qq.com（企业微信管理后台）' },
+        note: '⚠ 智能机器人**只能服务企业内部成员** —— 外部群、上下游群加不了它，单聊也只覆盖"机器人可见范围内"的成员。另外每个机器人同时只允许一条连接，新连接会把旧的踢下线。',
+      },
     };
 
     /** 阶段 → 界面上那句话 + 颜色。宿主返回的 phase 是唯一真相。 */
