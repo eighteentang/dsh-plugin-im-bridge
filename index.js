@@ -847,15 +847,38 @@ export function apply(ctx, config = {}) {
   /**
    * 给设置页写。返回 { ok, platforms } 或 { ok:false, error }。
    *
-   * ⚠ QQ 不允许关闭 —— 这个会话就跑在它上面，关掉等于把通信掐断。
-   *   明确报错而不是静默忽略：静默忽略会让用户以为关掉了。
+   * ── 关于"能不能关掉某个平台"（2026-10-08 改）──────────────────────
+   *
+   * 原来这里是三条硬编码，把 QQ 做成"常开、不可关"：
+   *   ① `if (id === 'qq' && enabled === false) return error`
+   *   ② `platformState = { ..., qq: true }` ← **写任何平台都强制把 qq 设回开**
+   *   ③（客户端那一半）`locked = meta.id === 'qq'` 画成禁用按钮
+   *
+   * 而当初给的理由是"当前会话就跑在它上面，关掉等于掐断通信" —— 那句**不成立**：
+   * QQ 用的是自己的专用会话（`im-bridge-dedicated-v1`），微信是另一个
+   * （`im-bridge-weixin-v1`），互相独立。关掉 QQ 只是不再监听 QQ、不再显示入口，
+   * 不会动到别的平台的会话。
+   *
+   * ② 还顺带是个 bug：你关掉**微信**，QQ 会被莫名其妙地设回开。
+   *
+   * ── 现在保留的唯一守卫 ──────────────────────────────────────────
+   * **不能把最后一个开着的平台关掉**。理由和平台无关、是通用的：
+   * 全关掉之后侧边栏一个入口都不剩，用户就再也找不到这个插件了
+   * （只能去设置页那个列表里找回来 —— 而列表本身也在插件里，自相矛盾）。
+   * 这是"防止不可恢复的状态"，不是"某个平台特殊"。
    */
   async function setPlatformEnabled(id, enabled) {
     if (!PLATFORM_IDS.includes(id)) return { ok: false, error: `未知平台：${String(id)}` };
-    if (id === 'qq' && enabled === false) {
-      return { ok: false, error: 'QQ 通道不能关闭：当前会话就跑在它上面' };
+    if (enabled === false && platformState[id] === true) {
+      const others = PLATFORM_IDS.filter((other) => other !== id && platformState[other] === true);
+      if (others.length === 0) {
+        return {
+          ok: false,
+          error: '至少要留一个平台开着 —— 全关掉之后侧边栏就没有入口了，得回到这里才能重新打开',
+        };
+      }
     }
-    platformState = { ...platformState, [id]: enabled === true, qq: true };
+    platformState = { ...platformState, [id]: enabled === true };
     const saved = savePlatforms();
     recordStatus('platform-set', { id, enabled: enabled === true, saved });
     return { ok: true, saved, platforms: { ...platformState } };
@@ -1003,10 +1026,24 @@ export function apply(ctx, config = {}) {
     if (!PLATFORM_IDS.includes(id)) return { ok: false, message: `未知平台：${String(id)}`, phase: 'error' };
 
     if (id === 'qq') {
+      // ⚠ 原来这里无条件返回"QQ 通道是常驻的，不用测试"。
+      //   现在 QQ 可关，所以要先看开关 —— 关着的时候回这句话是错的。
+      if (platformState.qq !== true) {
+        setRuntime('qq', 'idle', 'QQ 开关是关的 —— 打开上面那个开关即可');
+        return { ok: false, phase: 'idle', message: 'QQ 开关是关的，先打开它' };
+      }
+      // 开着的时候：把当前真实连接状态如实说出来，并顺手重连一次
+      //（用户点"测试"的意图就是"现在到底通不通"，那就真去连一次）。
+      await restartConnection('用户点了测试');
+      const connected = qq !== null;
+      setRuntime('qq', connected ? 'connected' : 'error',
+        connected ? 'QQ 连接正常' : 'QQ 没连上 —— 检查 AppID / Secret');
       return {
-        ok: true,
-        phase: 'connected',
-        message: 'QQ 通道是常驻的，不用测试 —— 看设置页最上面的实时状态即可',
+        ok: connected,
+        phase: connected ? 'connected' : 'error',
+        message: connected
+          ? 'QQ 连接正常'
+          : 'QQ 没连上 —— 检查「设置 → 连接 IM」里的 AppID / Secret',
       };
     }
 
@@ -2902,8 +2939,15 @@ export function apply(ctx, config = {}) {
   //   所以这里用 await 链起来，而不是各跑各的。
   void (async () => {
     await migrateCredentialKey();
-    await restartConnection('启动');
-    // ⚠ 再恢复其它**已启用且能双向收发**的平台（目前是微信）。
+    // ⚠ QQ 也要看开关（2026-10-08 改）。原来这里**无条件**连 QQ ——
+    //   那时 QQ 被做成"常开"，所以无条件是对的。现在 QQ 可以关，
+    //   若不看开关，会出现"界面上关掉了、后台还在监听 QQ"的假象。
+    if (platformState.qq === true) {
+      await restartConnection('启动');
+    } else {
+      recordStatus('platform-startup-skipped', { id: 'qq', reason: 'QQ 开关是关的' });
+    }
+    // 再恢复其它**已启用且能双向收发**的平台（目前是微信）。
     //   放在 QQ 之后：QQ 是主通道，先让它起来；恢复别的失败也不影响它。
     //   没有这一步的话，用户重启客户端后微信通道是**死的** ——
     //   表现是"发了消息没反应"，而日志里连一条 weixin 事件都没有（实测踩过）。

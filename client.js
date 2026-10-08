@@ -557,7 +557,15 @@ window.__ModuleLoader__.load({
       /** 一行平台：开关 + 阶段 + 展开后的凭据与测试 */
       const rowFor = (meta) => {
         const on = platforms?.[meta.id] === true;
-        const locked = meta.id === 'qq';
+        // ⚠ 2026-10-08：原来这里写死 `locked = meta.id === 'qq'`，把 QQ 画成禁用按钮
+        //   （文字"常开"）。那是一条**站不住**的策略 —— QQ 用的是自己的专用会话，
+        //   关掉它不会影响别的平台（详见宿主 setPlatformEnabled 的说明）。
+        //
+        //   现在唯一的"不可关"判据是**通用的**：它是最后一个开着的平台。
+        //   全关掉会让侧边栏一个入口都不剩，用户就找不回这个插件了。
+        const isLastOne = on
+          && PLATFORMS.filter((p) => p.id !== meta.id && platforms?.[p.id] === true).length === 0;
+        const locked = isLastOne;
         const runtime = state?.status?.[meta.id] ?? null;
         const phase = String(runtime?.phase ?? 'idle');
         const result = results[meta.id] ?? null;
@@ -603,10 +611,10 @@ window.__ModuleLoader__.load({
           type: 'button',
           disabled: locked,
           title: locked
-            ? 'QQ 通道不能关闭：当前会话就跑在它上面'
+            ? '它是最后一个开着的平台 —— 全关掉之后侧边栏就没有入口了'
             : (on ? '点击关闭，侧边栏入口会消失' : '点击开启，侧边栏会出现入口'),
           onClick: () => { void toggle(meta.id, !on); },
-        }, locked ? '常开' : (on ? '已开启' : '已关闭')),
+        }, locked ? '至少留一个' : (on ? '已开启' : '已关闭')),
         h('button', {
           className: 'qqb-btn qqb-btn-ghost',
           type: 'button',
@@ -1929,31 +1937,25 @@ window.__ModuleLoader__.load({
         //   "Global panel icons. Each list id addresses the matching main panel"
         // 所以 sidebar.panellist 的 id 必须和 main 的 key **一致**（都用 <平台>-panel）。
         //
-        // QQ 与微信**都静态注册**：这两个平台的传输层已实现（能收能发能接 agent），
-        //   入口和功能同生共死 —— 禁用插件时图标和面板一起消失，
-        //   不会出现"插件没了但图标还在、点了是空白"。
-        //   ⚠ 微信原来是**动态注册**（跟其余三个"只收不发"的平台一起），
-        //     于是面板用的是占位壳（`makePlatformPanel`）——
-        //     用户点进去看到"传输层未接入"，而它其实早就通了（2026-10-08 修）。
-        // 其余三个平台（企微/飞书/钉钉）**动态注册**：
-        //   它们出站未实现，开关状态在宿主（设置页改），这边每 5 秒对齐一次。
-        const staticIds = ['qq', 'weixin'];
-        const staticMetas = () => PLATFORMS.filter((p) => staticIds.includes(p.id));
-        const dynamicMetas = () => PLATFORMS.filter((p) => !staticIds.includes(p.id));
+        // QQ 与微信的**面板**静态注册（`QqPanel` 是共用实现，bind 各自 meta）；
+        // 但它们的**侧边栏入口**走动态注册 —— 因为现在两个平台都可以被关掉，
+        // 而入口必须跟着开关走（关了还留着入口 = 点了是空白）。
+        // 其余三个平台（企微/飞书/钉钉）面板仍是占位壳，也走动态注册。
+        //
+        //   ⚠ 为什么不像原来那样把 QQ 入口静态注册：那时 QQ 是"常开、不可关"，
+        //     所以"一直在"是对的。现在它能关，静态注册就会在关掉后留下一个
+        //     指向空面板的入口。
+        const staticPanelIds = ['qq', 'weixin'];
+        const staticMetas = () => PLATFORMS.filter((p) => staticPanelIds.includes(p.id));
+        const dynamicMetas = () => PLATFORMS.filter((p) => !staticPanelIds.includes(p.id));
 
         ctx.slots.inject('sidebar.panellist', () => {
-          const disposers = staticMetas().map((meta) => ctx.slots.register({
-            name: 'sidebar.panellist',
-            id: meta.panelId,
-            order: meta.order,
-            label: () => meta.title,
-          }, makePlatformIcon(meta)));
+          // 所有平台的入口都动态注册（开关状态在宿主，这边每 5 秒对齐一次）
           const disposeOthers = wireDynamicPlatforms(
             (meta) => ({ name: 'sidebar.panellist', id: meta.panelId, order: meta.order, label: () => meta.title }),
             (meta) => makePlatformIcon(meta),
-            dynamicMetas,
           );
-          return () => { disposeOthers(); for (const d of disposers) d(); };
+          return () => { disposeOthers(); };
         });
 
         ctx.slots.inject('main', () => {
