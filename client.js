@@ -1163,16 +1163,7 @@ window.__ModuleLoader__.load({
         },
       },
       {
-        id: 'wecom', panelId: 'wecom-panel', title: '企业微信', order: 102, art: WecomArt, live: false,
-        maturity: 'inbound', maturityText: '只能收 —— 发不回去',
-        accent: '#2F7DFF',
-        emptyTitle: '企业微信只能收，不能回',
-        emptyDesc: '官方长连接（wss://openws.work.weixin.qq.com）免公网，订阅 + 心跳 + 收消息都已实现；'
-          + '**但回复帧的形状官方未公开**，所以它只报"订阅成功 + 收到过几条"，不假装能回。'
-          + '只能服务企业内部成员。',
-      },
-      {
-        id: 'feishu', panelId: 'feishu-panel', title: '飞书Bot', order: 103, art: FeishuArt, live: false,
+        id: 'feishu', panelId: 'feishu-panel', title: '飞书Bot', order: 102, art: FeishuArt, live: false,
         maturity: 'inbound', maturityText: '能收，但发不回去',
         accent: '#3370FF',
         emptyTitle: '飞书还没接上出站',
@@ -1181,13 +1172,22 @@ window.__ModuleLoader__.load({
           + '要先在设置页安装可选组件，且这一家的实现成本最高。',
       },
       {
-        id: 'dingtalk', panelId: 'dingtalk-panel', title: '钉钉Bot', order: 104, art: DingtalkArt, live: false,
+        id: 'dingtalk', panelId: 'dingtalk-panel', title: '钉钉Bot', order: 103, art: DingtalkArt, live: false,
         maturity: 'inbound', maturityText: '能收，但发不回去',
         accent: '#3296FA',
         emptyTitle: '钉钉还没接上出站',
         emptyDesc: 'Stream 模式走官方 SDK（`dingtalk-stream` 的 DWClient）。'
           + '入站已实现；**出站还没做**（Stream 通道本身不能回复，发送要另走 REST），所以现在接不了 agent。'
           + '要先在设置页安装可选组件。',
+      },
+      {
+        id: 'wecom', panelId: 'wecom-panel', title: '企业微信', order: 104, art: WecomArt, live: false,
+        maturity: 'inbound', maturityText: '只能收 —— 发不回去',
+        accent: '#2F7DFF',
+        emptyTitle: '企业微信只能收，不能回',
+        emptyDesc: '官方长连接（wss://openws.work.weixin.qq.com）免公网，订阅 + 心跳 + 收消息都已实现；'
+          + '**但回复帧的形状官方未公开**，所以它只报"订阅成功 + 收到过几条"，不假装能回。'
+          + '只能服务企业内部成员。',
       },
     ];
 

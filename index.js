@@ -100,6 +100,33 @@ const PLATFORM_CREDENTIAL_KEYS = {
 };
 
 /**
+ * 通道纪律 —— 注入给"经 IM 转达"的会话。
+ *
+ * 为什么必须有它（真实代价，2026-10-09）：用户是在**手机上**看回复，而 IM 客户端
+ * **不渲染 Markdown**。于是 `**粗体**` 原样显示成两个星号、表格变成一堆竖线 ——
+ * 可读性直接崩掉。用户的原话是「很多 * · 这种 markdown 格式」。
+ *
+ * 关键点：**agent 看不到自己在什么通道上**，所以它不会自己知道这件事。
+ * 必须**在提示词源头约束**（照抄 dsh-wecom-plugin 的 conciseOutput 做法），
+ * 而不是事后靠人提醒 —— 那是"靠记得"，迟早失效（见经验库 E19）。
+ */
+const CHANNEL_DISCIPLINE = [
+  'Delivery channel: plain-text chat app.',
+  '',
+  'Your replies are relayed to the user through a chat app (QQ / WeChat / Feishu / DingTalk)',
+  'and are read on a phone. Markdown is NOT rendered in that client.',
+  '',
+  'Therefore:',
+  '- No tables, no headings, no horizontal rules, no block quotes.',
+  '- No bold or italic markers. They show up literally as asterisks or underscores.',
+  '- Keep paragraphs to 2-4 lines and separate them with a blank line.',
+  '- Structure with plain numbered lists (1. 2. 3.) or Chinese ordinals, not with markup.',
+  '- Use a fenced code block only when the user must copy something verbatim.',
+  '- For long reports, finish with a short "what to do next" section.',
+  '- Prefer short and concrete over exhaustive: the user is reading on a phone.',
+].join('\n');
+
+/**
  * 每个平台的凭据字段名，分"非密"与"密"两类。
  *
  * ⚠ 为什么要把这个列出来（2026-10-08 加）：`getCredentialInfo` 要判断
@@ -1805,6 +1832,33 @@ export function apply(ctx, config = {}) {
    *     "Bind an **unpublished** Agent to the current preset revision"
    *   —— setup 回调正好是在发布之前跑的，所以 create / resume **两条路都能绑上**。
    */
+  /**
+   * 给"经 IM 转达"的会话注入通道纪律（见 CHANNEL_DISCIPLINE）。
+   *
+   * 契约（照抄 dsh-wecom-plugin/src/bridge.js:1051 —— 那是已验证的写法）：
+   *   agentCtx.systemPrompt.section({ name, order, text })
+   *   order 取 `getSectionOrder('DEPLOYMENT_PERSONA_PREFIX')`：DSH 0.1.5+ 把
+   *   `DEPLOYMENT_PERSONA` 拆成了 PREFIX/SUFFIX，前缀键是权威的（order 0）。
+   *   `?? 0` 只是"order 必须是有限数"的兜底 —— section() 遇到非有限数会抛。
+   *
+   * ⚠ 注入失败**不能让 create/resume 失败**（和 bindPreset 同一原则）：
+   *   setup 里抛错会导致整个会话建不起来。所以整体 try/catch + 记状态日志。
+   */
+  function applyChannelPrompt(agentCtx) {
+    const systemPrompt = agentCtx?.systemPrompt;
+    if (typeof systemPrompt?.section !== 'function') {
+      recordStatus('channel-prompt-skipped', { reason: 'systemPrompt.section 不可用' });
+      return;
+    }
+    try {
+      const order = systemPrompt.getSectionOrder?.('DEPLOYMENT_PERSONA_PREFIX') ?? 0;
+      systemPrompt.section({ name: 'im-bridge-channel-discipline', order, text: CHANNEL_DISCIPLINE });
+      recordStatus('channel-prompt-applied', { order });
+    } catch (error) {
+      recordStatus('channel-prompt-failed', { message: String(error?.message ?? error).slice(0, 200) });
+    }
+  }
+
   async function bindPreset(agentCtx, agent) {
     const presets = ctx.get('agentPresets');
     if (presets === undefined) {
@@ -2119,6 +2173,7 @@ export function apply(ctx, config = {}) {
         ...(resumeAgentOptions === undefined ? {} : { agentOptions: resumeAgentOptions }),
         setup: async (agentCtx, agent) => {
           await bindPreset(agentCtx, agent);
+          applyChannelPrompt(agentCtx);
         },
       });
       recordStatus('dedicated-resumed', {
@@ -2227,6 +2282,7 @@ export function apply(ctx, config = {}) {
         ...(agentOptions === undefined ? {} : { agentOptions }),
         setup: async (agentCtx, agent) => {
           await bindPreset(agentCtx, agent);
+          applyChannelPrompt(agentCtx);
         },
       });
       recordStatus('dedicated-created', {
