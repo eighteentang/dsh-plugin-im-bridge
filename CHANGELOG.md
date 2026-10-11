@@ -8,8 +8,50 @@
 **怎么钉版本**（避免"装到一半上游改了"）：
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.4
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.5
 ```
+
+---
+
+## [1.2.5] - 2026-10-11
+
+### 修复
+
+- **插件列表里显示的是包名 `dsh-plugin-im-bridge`，不是「IM 桥接」；也没有图标**
+
+  根因：展示元数据写在了 `package.json` 的 `meta` 字段里，而**那个字段根本不被读**。
+
+  DSH 的真实机制（读 `dsh-app-boot/lib/index.js` 的 `readPluginMeta()` 确认）是：
+
+  - 标题/描述来自 **`locale/en.json`**（它是 base）里的 `{"meta":{"title","description"}}`
+  - 图标来自 `package.json` 顶层的 **`icon`** 字段（相对路径，svg/png/jpeg/webp，≤256 KiB）
+  - locale 文件经 **Node ESM 解析器**读取 → **受 `exports` 门控**；
+    没放行会得到 `ERR_PACKAGE_PATH_NOT_EXPORTED`，而被当作"没有元数据"**静默略过**
+
+  本次改动：新增 `locale/en.json`、`locale/zh.json`、`icon.svg`；
+  `exports` 加 `"./locale/*"`；顶层加 `"icon": "icon.svg"`；
+  `files` 补 `locale` 与 `icon.svg`；**删掉那个无效的 `meta` 字段**。
+
+  > 这类失效是**静默的** —— 插件照常工作，只是没名字没图标，界面上不报任何错。
+
+### 文档
+
+- **README 的安装说明改成"界面为主"**：原来只给命令行
+  （`dsh plugin --profile <名字> add …`），对不用命令行的用户是门槛。
+  现在首选**在 DSH 界面里装**：插件页 →「添加插件」→ 填 GitHub 地址。
+
+  三条查证过的依据（都是 DSH 界面/服务的**原文**，不是推测）：
+
+  - 安装页说明就是「输入插件的**包名、GitHub 仓库地址**或本地目录路径」
+  - `pluginManager.installBundle` 的 spec 接受 git 地址（`InstallSpecKind: 'git'`），
+    且 GitHub 仓库会先做连接检查再交给 pnpm
+  - spec 从界面到宿主**原样传递**：`inspect(spec)` → `startInstall({ spec })` → `installBundle(spec, …)`
+
+  另外补了两条会踩的坑：
+
+  - **不能只填 `dsh-plugin-im-bridge`** —— 这个插件**没发布到 npm**、只发 GitHub，
+    只填包名会被拒（而界面的引导却提示"填插件包名"，很误导）
+  - **界面装的插件暂不支持自动更新**（界面原文），升级要卸载重装
 
 ---
 

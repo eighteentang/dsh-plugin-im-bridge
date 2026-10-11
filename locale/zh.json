@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "IM 桥接",
+    "description": "把 QQ / 微信等 IM 接成 DSH 的对话入口：手机上给机器人发消息，电脑上的 agent 干活。"
+  }
+}

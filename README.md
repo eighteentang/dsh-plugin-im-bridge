@@ -117,51 +117,81 @@ AppSecret   —— 一串字母数字，**不要外传**
 
 已经装好 DSH 并能正常对话（能登录、能发消息）。
 
-### 方式：命令行安装
+### 方式一：在 DSH 界面里装（推荐，不用命令行）
+
+1. 打开 DSH 侧边栏的 **插件** 页
+2. 点 **「添加插件」**
+3. 在「包名或地址」里填**这个插件的 GitHub 地址**：
+
+```sh
+github:eighteentang/dsh-plugin-im-bridge#v1.2.5
+```
+
+4. 确认安装，然后**重启 DSH 客户端**
+
+> ⚠ **必须填完整地址，不能只填 `dsh-plugin-im-bridge`。**
+> 那个输入框的引导会提示"填插件包名" —— 但这个插件**没有发布到 npm**，
+> 只发在 GitHub 上。只填包名会被拒（找不到该包）。
+>
+> 界面原文是「输入插件的包名、**GitHub 仓库地址**或本地目录路径」——
+> 我们属于第二种。
+
+> ⚠ **GitHub 地址不经过 npm 安装源**（这是 DSH 界面自己的提示）：
+> 「GitHub 地址和 .tgz 直链不经过安装源，需要本机能直接访问它或配置代理」。
+> 所以如果卡住/超时，先确认这台机器**能访问 github.com**（或已配代理）。
+>
+> 如果你所在网络访问 GitHub 困难，就只能先用下面的命令行方式配好代理再装。
+
+### 方式二：命令行安装（等价，适合脚本/远程）
 
 DSH 自带插件管理命令：
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.4
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.5
 ```
 
 > **`--profile` 的名字**：填**你自己的** profile 名 —— 看 `~/.dsh/profiles/`
 > 下的目录名就是它。
 >
-> ⚠ 上面示例里的 `web` 是 **DSH 随附的模板名**，不必然是你的 profile 名。
+> ⚠ `web` 是 **DSH 随附的模板名**，不必然是你的 profile 名。
 > 用 `dsh --profile <名字> --from-default-profile <模板>` 新建过的 profile
 > 会是别的名字（例如 `desktop`）。**写错名字 = 装到另一个 profile，当前客户端看不到。**
 
-装完后**重启 DSH 客户端**。
-
 ### 验证装上了
 
-重启后 DSH 客户端里应该出现：
+**重启后**（两种方式都要重启）DSH 客户端里应该出现：
 
 ```
 · 设置 → 连接 IM          ← 配置凭据的地方
 · 侧边栏一个企鹅图标       ← 点开是 QQ 会话面板
 ```
 
-**看不到？** 检查两件事：
+**看不到？** 检查三件事：
 
-1. 插件装到了**正确的 profile**（`dsh plugin --profile <名字> list` 能看）
+1. 插件装到了**正确的 profile**（命令行：`dsh plugin --profile <名字> list`）
 2. 客户端**真的重启了** —— 只禁用再启用不够，Node 的模块缓存会让它继续用旧代码
+3. 界面装的：那一步是否真的提示成功（失败时界面会显示原因）
 
-### 钉住版本（推荐）
+### 关于版本
 
-上面的命令装的是 `main` 的**最新提交** —— 上游随时可能变。
-想要一个**不会自己变**的版本，就用标签：
+上面两种方式都**推荐带 `#v1.2.5`** —— 不写标签装的是 `main` 的**最新提交**，
+上游随时可能变。
 
 ```sh
-# 装某个具体版本
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.4
+# 装某个具体版本（把 v1.2.4 换成你要的）
+github:eighteentang/dsh-plugin-im-bridge#v1.2.5
 
 # 看有哪些版本可选
 #   https://github.com/eighteentang/dsh-plugin-im-bridge/tags
 ```
 
-> ⚠ **微信用户请用 `v1.2.2` 或更新**。
+> ⚠ **DSH 界面里装的插件暂不支持自动更新**（界面原文）：
+> 「插件安装后，暂不支持自动更新。若需升级，请先卸载再安装新版」。
+> 所以升级要手动重来一次 —— 换成新的 `#vX.Y.Z` 重装。
+
+### ⚠️ 版本注意（微信用户）
+
+> **请用 `v1.2.2` 或更新**。
 > `v1.2.1` 及更早的版本发微信回复时**缺一个 `client_id` 字段** ——
 > 表现是：日志显示发送成功（HTTP 200），但微信里**只有第一条消息出现**，
 > 之后每条都收不到。`v1.2.2` 修的就是这个。
@@ -171,7 +201,7 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-br
 ### 升级
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.4   # 换成的版本号
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.5   # 换成的版本号
 ```
 
 然后**重启客户端**。
@@ -188,7 +218,7 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-br
 看 profile 里那份 `package.json` 的 `dsh-plugin-im-bridge` 字段：
 
 ```sh
-# 装了标签版 → 显示 github:eighteentang/dsh-plugin-im-bridge#v1.2.4
+# 装了标签版 → 显示 github:eighteentang/dsh-plugin-im-bridge#v1.2.5
 # 装了浮动版 → 显示 github:eighteentang/dsh-plugin-im-bridge
 cat ~/.dsh/profiles/<profile名>/package.json
 ```
