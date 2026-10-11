@@ -26,7 +26,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, basename, extname } from 'node:path';
 import { homedir } from 'node:os';
 import { startStatusServer } from './control-server.js';
 import { createBusyTracker } from './busy-tracker.js';
@@ -49,6 +49,15 @@ import {
   listComponents,
   removeComponent,
 } from './components.js';
+import {
+  MAX_INLINE_UPLOAD_BYTES,
+  formatBytes,
+  mediaDirFor,
+  qqFileTypeOf,
+  safeFileName,
+  saveInboundMedia,
+  withMediaPaths,
+} from './media.js';
 
 /**
  * 状态文件 —— 让插件的行为可被外部观测。
@@ -786,6 +795,67 @@ class QqClient {
     }
   }
 
+  /**
+   * 发富媒体（图片 / 视频 / 语音 / 文件）。
+   *
+   * 官方流程是两步（2026-10-12 从官方文档核实，不是凭记忆）：
+   *   ① POST /v2/users/{openid}/files          → 拿到 file_info
+   *   ② POST /v2/users/{openid}/messages       → { msg_type: 7, media: { file_info } }
+   *
+   * ⚠ 上传有三条路，本机目前只能走「二进制直传」：
+   *   · URL 上传要求文件**已在公网可访问** —— 我们的文件在本地磁盘上，不满足；
+   *   · 分片上传要四步（预上传 → 逐片 PUT → 每片 finish → 合并），是给大文件用的；
+   *   · 二进制直传上限 5MB。
+   *   超过 5MB 时**明确报错**，而不是硬传一个会被截断的东西 ——
+   *   分片上传是下一版该做的事，不是这一版偷偷糊过去的事。
+   *
+   * ⚠ `file_data` 的编码：官方只写「直接上传二进制数据」，没写是不是 base64。
+   *   这里按 base64 发 —— JSON 里放不了原始二进制，同类接口几乎都是 base64。
+   *   若平台实际收的不是这个编码，症状是 err_code=850019（不支持的文件格式），
+   *   第一次真机发送就能看出来。真错了就换编码，而不是加个 catch 装作没事。
+   */
+  async sendMedia(openid, { filePath, fileName, fileType }, msgId, onEvent) {
+    const buffer = readFileSync(filePath);
+    if (buffer.length > MAX_INLINE_UPLOAD_BYTES) {
+      throw new Error(
+        `文件 ${formatBytes(buffer.length)} 超过二进制直传上限 ${formatBytes(MAX_INLINE_UPLOAD_BYTES)}`
+        + '，需要分片上传（尚未实现）',
+      );
+    }
+
+    onEvent?.('media-upload-start', { name: fileName, bytes: buffer.length, fileType });
+    const uploaded = await this.apiPost(`/v2/users/${openid}/files`, {
+      file_type: fileType,
+      file_name: fileName,
+      file_data: buffer.toString('base64'),
+      srv_send_msg: false,
+    });
+    const fileInfo = uploaded?.file_info;
+    if (typeof fileInfo !== 'string' || fileInfo === '') {
+      throw new Error(`上传成功响应里没有 file_info：${JSON.stringify(uploaded ?? null).slice(0, 200)}`);
+    }
+    onEvent?.('media-uploaded', { ttl: uploaded?.ttl ?? null, bytes: buffer.length });
+
+    // 送达策略与 reply 完全相同：先试被动回复，失败退回主动推送。
+    // 判据也一样 —— **响应里带消息 id 才算送达**（QQ 对无效 msg_id 会返回
+    // HTTP 200 但不投递，光看状态码分辨不出来，那个坑 reply 上面记着）。
+    const base = { msg_type: 7, media: { file_info: fileInfo } };
+    if (msgId !== undefined) {
+      let ok = false;
+      try {
+        const data = await this.apiPost(`/v2/users/${openid}/messages`, { ...base, msg_id: msgId });
+        ok = typeof data?.id === 'string' && data.id !== '';
+        onEvent?.(ok ? 'media-replied-passive' : 'media-passive-no-id', { id: data?.id ?? null });
+      } catch (error) {
+        onEvent?.('media-passive-failed-fallback', { message: String(error?.message ?? error).slice(0, 200) });
+      }
+      if (ok) return { delivered: 'passive' };
+    }
+    const data = await this.apiPost(`/v2/users/${openid}/messages`, base);
+    onEvent?.('media-replied-active', { id: data?.id ?? null });
+    return { delivered: 'active' };
+  }
+
   async connect() {
     await this.ensureToken();
     const gateway = await this.apiGet('/gateway');
@@ -876,6 +946,16 @@ export function apply(ctx, config = {}) {
 
   // QQ openid → DSH 会话 id 的绑定
   const bindings = new Map();
+
+  /**
+   * 最近一个给机器人发过消息的 QQ 用户的 openid。
+   *
+   * 为什么需要它：agent 要**主动**发东西给用户时，得知道发给谁。
+   * 每个平台都有各自的"回复目标"，而 QQ 单聊的目标就是 user_openid ——
+   * 只有在收到过对方消息之后才知道这个值。
+   * 所以记住最后一个，让「发文件」这类主动操作有个默认收件人。
+   */
+  let lastOpenid = null;
   // 正在累积的回答：sessionId → { text, reasoning, openid, msgId }
   const pending = new Map();
 
@@ -1686,16 +1766,31 @@ export function apply(ctx, config = {}) {
       }
 
       if (type === 'C2C_MESSAGE_CREATE') {
-        const text = String(data.content ?? '').trim();
+        const rawText = String(data.content ?? '').trim();
         const openid = data.author?.user_openid;
-        recordStatus('c2c-message', { openid: openid ?? null, text: text.slice(0, 80) });
-        if (openid === undefined || text === '') return;
+        const attachments = Array.isArray(data.attachments) ? data.attachments : [];
+        recordStatus('c2c-message', {
+          openid: openid ?? null,
+          text: rawText.slice(0, 80),
+          attachmentCount: attachments.length,
+        });
+        if (openid === undefined) return;
+        // ⚠ 判据从「有文字」改成「有文字**或**有附件」。
+        //   原来只判文字，于是**纯图片消息会在这里被静默丢掉** ——
+        //   而"对方只发一张图、不打字"恰恰是最常见的用法（用户就是这么发的）。
+        if (rawText === '' && attachments.length === 0) return;
 
-        // 去重：同一条消息被平台重推时只处理一次（判据是平台消息 id）
+        // 去重放在**下载之前**：平台会给同一条消息重推，重复下载既慢又浪费流量
+        // （官方原话：为确保消息可达，相同 msg_id 可能重复推送）。
         if (!rememberInbound(typeof data.id === 'string' ? `qq:${data.id}` : '')) {
           recordStatus('dedup-dropped', { platform: 'qq', messageId: String(data.id ?? '').slice(0, 48) });
           return;
         }
+
+        // 附件先落盘到桌面，再把本地路径拼进给 agent 的文字里 ——
+        // agent 靠这个路径读图（本机没有别的通道能把图片交给它）。
+        const media = await saveInboundMedia('qq', attachments, (event, detail) => recordStatus(event, detail ?? {}));
+        const text = withMediaPaths(rawText, media);
 
         // ⚠ 必须用「非空字符串才算数」的判断，不能用 ?? ——
         // Config schema 把 sessionId 默认成 ''，而 '' 不是 null/undefined，
@@ -1707,6 +1802,7 @@ export function apply(ctx, config = {}) {
           `qq-${openid.slice(0, 12)}`,
         ]);
         bindings.set(openid, sessionId);
+        lastOpenid = openid;   // 供 agent 主动发送时定位收件人
         // 队列按"QQ 用户"分组即可 —— 真正的投递目标由 resolveTargetAgent 决定
         enqueueDelivery(sessionId, text, openid, data.id);
         return;
@@ -3156,6 +3252,90 @@ export function apply(ctx, config = {}) {
   } catch (error) {
     recordStatus('status-server-start-failed', { message: String(error?.message ?? error) });
   }
+
+  // ---- Agent 工具：让 agent 能把本地文件主动发到手机上
+  //
+  // 契约照抄 dev-tools/experience-tool.js（本机验证过能跑的写法），两条都是坑：
+  //   · 服务要从 `ctx.inject(['tools'], (scoped) => …)` 回调的**属性**上取
+  //     （`scoped.tools`）。用 `ctx.get('tools')` 实测拿不到服务，
+  //     而且失败时什么都看不见 —— Host 的 logger 桌面不落盘。
+  //   · `parameters` 必须是**真正的 JSON Schema**。简写格式是 `defineTool()` 的
+  //     输入，直接传给 register 会让模型 API 报
+  //     `{"type":"string","required":true,…} is not of type "string"`，整轮失败。
+  const toolFiber = ctx.inject(['tools'], (scoped) => {
+    const tools = scoped?.tools;
+    if (tools === undefined || typeof tools.register !== 'function') {
+      recordStatus('media-tool-skipped', { reason: '拿不到 tools 服务' });
+      return () => {};
+    }
+
+    let dispose;
+    try {
+      dispose = tools.register({
+        name: 'im_send_media',
+        description: [
+          '把一个本地文件发到用户的手机上（走 im-bridge 当前可用的 IM 渠道）。',
+          '',
+          '支持图片（png/jpg/gif/webp/bmp）、视频（mp4）、语音（silk）和任意文件。',
+          `单个文件**不能超过 5MB** —— 这一版只实现了官方的小文件直传通道，`,
+          '更大的文件需要分片上传，尚未实现（超过会明确报错，不会悄悄截断）。',
+          '',
+          '收件人是**最近一个给机器人发过消息**的 QQ 用户。所以用之前要确保',
+          '用户刚给你发过消息，否则没有可回复的对象。',
+          '',
+          '发的是主动消息 —— QQ 对主动消息有每日条数上限，用户也可以在自己的',
+          '客户端关掉"允许主动发送"。真发不出去时看返回的错误，不要假定成功。',
+        ].join('\n'),
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: '要发送的本地文件的绝对路径' },
+            caption: { type: 'string', description: '可选。会先发这条文字，再发文件' },
+          },
+          required: ['path'],
+        },
+        output: {
+          schema: { type: 'object' },
+          render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+        },
+        async execute(args) {
+          const filePath = String(args?.path ?? '').trim();
+          if (filePath === '') return { ok: false, error: 'path 不能为空' };
+          if (!existsSync(filePath)) return { ok: false, error: `文件不存在：${filePath}` };
+          if (qq === null) return { ok: false, error: 'QQ 连接未建立（没有凭据或没连上）' };
+          if (lastOpenid === null) {
+            return { ok: false, error: '还没有可回复的 QQ 会话 —— 请先在手机上给机器人发一条消息' };
+          }
+
+          const onEvent = (event, detail) => recordStatus(event, detail ?? {});
+          const fileName = safeFileName(basename(filePath), extname(filePath));
+          try {
+            const caption = String(args?.caption ?? '').trim();
+            if (caption !== '') await qq.reply(lastOpenid, caption, undefined, onEvent);
+
+            const bytes = readFileSync(filePath).length;
+            const result = await qq.sendMedia(
+              lastOpenid,
+              { filePath, fileName, fileType: qqFileTypeOf(filePath) },
+              undefined,
+              onEvent,
+            );
+            recordStatus('media-tool-sent', { file: fileName, bytes, delivered: result.delivered });
+            return { ok: true, file: fileName, bytes, delivered: result.delivered };
+          } catch (error) {
+            const message = String(error?.message ?? error).slice(0, 300);
+            recordStatus('media-tool-failed', { file: fileName, message });
+            return { ok: false, error: message };
+          }
+        },
+      });
+      recordStatus('media-tool-registered', {});
+    } catch (error) {
+      recordStatus('media-tool-register-failed', { message: String(error?.message ?? error).slice(0, 200) });
+      return () => {};
+    }
+    return () => { try { dispose(); } catch { /* ignore */ } };
+  });
 
   // ---- 随插件（即随客户端进程）释放。
   // 正确写法是 ctx.effect(() => teardown)；ctx.on('dispose') 在 DSH 里不存在。
