@@ -685,18 +685,86 @@ export const Config = ConfigSchema;
 // 协议部分是从已验证可跑的 qq-bridge.mjs 搬过来的，不需要重写。
 const INTENTS = 1 << 25;   // GROUP_AND_C2C_EVENT：单聊 + 群@
 
+/**
+ * 心跳判活的参数（2026-10-14 加）。
+ *
+ * ── 为什么必须有这个东西（一次真实的"静默死亡"）──────────────────
+ * 用户早上发消息，QQ 回「灵魂不在线，机器人已下线」。而插件这边
+ * `/status` 报的是 `connected: true` —— **它已经 7.6 小时不知道自己死了**。
+ *
+ * 原因是两件事叠加：
+ *   ① 电脑睡了一夜 → 对端（腾讯网关）把 TCP 关了，但**本机 Node 收不到
+ *      `close` 事件**（TCP 的经典行为：对端静默消失）。于是 `close`
+ *      处理器从不触发、重连从不发生。
+ *   ② 我们的心跳是"**只发不验**"的：
+ *        if (socket.readyState === OPEN) socket.send({op:1,...})
+ *      僵尸连接上 `readyState` 永远是 OPEN，发送失败也不抛错 ——
+ *      所以没有任何东西能发现"连接已经死了"。
+ *
+ * 官方给的存活判据（bot.q.qq.com 文档 · opcode 表）：
+ *   op 1  Heartbeat      客户端发
+ *   op 11 Heartbeat ACK  「当发送心跳成功之后，就会收到该消息」
+ *
+ * 所以判活规则很简单：**发了心跳却收不到 ACK，就是死了**。
+ * 允许漏 2 次（网络抖动、服务端偶发慢），第 3 次仍未收到 ACK 就主动
+ * `close()` —— 这样 `close` 处理器才会触发，重连才会发生。
+ */
+const HEARTBEAT_ACK_TOLERANCE = 2;
+
+/** 心跳 ACK 判活：连续多少轮没收到 ACK 就该断开重连。纯函数，便于校验器直接调。 */
+export function heartbeatAckExceeded(consecutiveMisses, tolerance = HEARTBEAT_ACK_TOLERANCE) {
+  return Number(consecutiveMisses) > Number(tolerance);
+}
+
 class QqClient {
-  constructor({ appId, appSecret, sandbox, log }) {
+  constructor({ appId, appSecret, sandbox, log, onStatus }) {
     this.appId = appId;
     this.appSecret = appSecret;
     this.apiBase = sandbox ? 'https://sandbox.api.sgroup.qq.com' : 'https://api.bot.qq.com';
     this.log = log;
+    /**
+     * 状态回调 —— 让"连接死了"这件事能**传到界面上**。
+     *
+     * 不加这个的话，代码里就算发现了断线，`/status` 与设置页依然报
+     * `connected: true`（那个 bug 的实际表现就是"界面说已连接、其实早就断了"）。
+     * 回调抛错不能影响连接本身，所以调用点都吞异常。
+     */
+    this.onStatus = typeof onStatus === 'function' ? onStatus : () => {};
     this.token = null;
     this.tokenExpireAt = 0;
     this.socket = null;
     this.heartbeat = null;
     this.refreshTimer = null;
     this.lastSeq = null;
+    /** 心跳定时器周期（毫秒），来自 op 10 Hello 的 heartbeat_interval。 */
+    this.heartbeatIntervalMs = 45_000;
+    /**
+     * 待确认的心跳条数（哨兵计数法）。
+     *
+     * 发一次心跳就 +1；收到 op 11 ACK 就 -1（不为负）。
+     * 如果这个数超过容忍值，说明**发了心跳但服务端一直不回应** = 连接已死。
+     *
+     * 为什么用计数而不是"给每个心跳记时间戳"：哨兵法不需要定时器、不需要
+     * 在每个心跳上挂状态，一个整数就够，也不会因为定时器精度产生漂移。
+     */
+    this.pendingHeartbeats = 0;
+    /** 重连是否已排期（防抖：close + 多次失败不能叠出多个重连定时器）。 */
+    this.reconnectTimer = null;
+    /**
+     * 是否正在处理一次断线（进门即置位）。
+     *
+     * ⚠ 这个标志必须存在，不能用 `reconnectTimer !== null` 代替 ——
+     *   `close()` 会**同步**回调 `close` 监听器，而那一刻排期还没发生。
+     *   详见 `onDisconnected` 里的说明。
+     */
+    this.disconnecting = false;
+    /** 连续失败次数，用于退避。连上就归零。 */
+    this.reconnectFailures = 0;
+    /** 已鉴权、可 Resume 的会话（op 6 用）。 */
+    this.sessionId = null;
+    this.resumeGatewayUrl = null;
+    /** `connect()` 是否已启动过（防重入）。 */
+    this.connectStarted = false;
     this.onMessage = () => {};
     this.closed = false;
   }
@@ -867,83 +935,257 @@ class QqClient {
     return { delivered: 'active' };
   }
 
+  /**
+   * 建立并维持到 QQ 网关的长连接。
+   *
+   * ── 三条"沉默故障"的修法（2026-10-14 重写）───────────────────────
+   *
+   * ① **心跳 ACK 判活**（原来只发不验）
+   *    发心跳 +1 计数、收 op 11 -1；超过容忍值仍未清零 → 主动 close。
+   *    这修的是"电脑睡了一夜，TCP 被对端关掉、本机收不到 close，
+   *    于是插件 7.6 小时不知道自己死了、界面一直显示已连接"。
+   *
+   * ② **断线时状态如实上报**（原来 close 里只重连、不改状态）
+   *    现在一旦进入重连流程就 `connecting`，连上（READY）再 `connected`。
+   *    界面绝不再停在"已连接"骗人。
+   *
+   * ③ **重连带退避、且不叠定时器**
+   *    原来固定 `setTimeout(open, 5000)` 且没有防抖 —— 反复失败会叠出多个
+   *    重连链。现在单个定时器 + 指数退避（上限 30 秒），连上即归零。
+   *
+   * 另外补上 **op 6 Resume**：断线期间网关会缓存事件，Resume 让它们补发。
+   * 官方原文：「断开之后短时间内重连会补发中间遗漏的事件」——
+   * 不做这一步，睡眠/断网那段时间别人发的消息会**永久丢失**。
+   * Resume 失败就退回 op 2 Identify 重新鉴权（清掉会话，不复用旧 seq）。
+   */
   async connect() {
-    await this.ensureToken();
-    const gateway = await this.apiGet('/gateway');
-    this.log(`网关：${gateway.url}`);
+    // 防重入：`connect()` 被调两次会叠出两个令牌刷新定时器、两条重连链。
+    if (this.connectStarted) return;
+    this.connectStarted = true;
 
-    const open = () => {
-      if (this.closed) return;
-      const socket = new WebSocket(gateway.url);
-      this.socket = socket;
-
-      socket.addEventListener('open', () => this.log('WebSocket 已连接'));
-
-      socket.addEventListener('message', (event) => {
-        let payload;
-        try { payload = JSON.parse(String(event.data)); } catch { return; }
-        if (payload.s !== undefined && payload.s !== null) this.lastSeq = payload.s;
-
-        switch (payload.op) {
-          case 10: {   // Hello → 发 Identify
-            const interval = payload.d?.heartbeat_interval ?? 45000;
-            if (this.heartbeat !== null) clearInterval(this.heartbeat);
-            this.heartbeat = setInterval(() => {
-              if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ op: 1, d: this.lastSeq }));
-            }, interval);
-            socket.send(JSON.stringify({
-              op: 2,
-              d: {
-                token: `QQBot ${this.token}`,
-                intents: INTENTS,
-                shard: [0, 1],
-                // ⚠ 这两个字段是**发给腾讯服务器**的握手标识（identify.properties）。
-                //   改名时一起改了（qq-bridge → im-bridge）——
-                //   它对 QQ 侧只是"这个客户端自称什么"，改掉是安全的，
-                //   但要知道它确实是**线上可见**的标识，不是纯本地字符串。
-                properties: { $os: 'windows', $browser: 'dsh-im-bridge', $device: 'dsh-im-bridge' },
-              },
-            }));
-            break;
-          }
-          case 0:      // Dispatch
-            this.onMessage(payload).catch((error) => this.log(`处理事件出错：${error.message}`));
-            break;
-          case 7:
-            this.log('服务端要求重连');
-            socket.close();
-            break;
-          case 9:
-            this.log('鉴权失败（Invalid Session）——检查 intents 权限或 token');
-            this.token = null;
-            break;
-          default:
-            break;
-        }
-      });
-
-      socket.addEventListener('close', () => {
-        if (this.closed) return;
-        if (this.heartbeat !== null) clearInterval(this.heartbeat);
-        this.log('连接断开，5 秒后重连');
-        setTimeout(open, 5000);
-      });
-
-      socket.addEventListener('error', (event) => this.log(`WebSocket 错误：${event?.message ?? '(无详情)'}`));
-    };
-
-    open();
-
-    // 令牌 7200 秒过期，定期刷新
     this.refreshTimer = setInterval(() => {
       this.ensureToken().catch((error) => this.log(`刷新令牌失败：${error.message}`));
     }, 30 * 60 * 1000);
+
+    this.scheduleOpen(0);
+  }
+
+  /** 上报状态给宿主（失败只记日志 —— 状态上报不该影响连接本身）。 */
+  reportStatus(phase, message) {
+    try { this.onStatus(phase, message); } catch (error) { this.log(`上报状态失败：${error.message}`); }
+  }
+
+  /**
+   * 排期一次连接尝试，带指数退避。
+   *
+   * `delayMs` 为 0 表示立即试（首次连接、或刚发现连接已死）。
+   */
+  scheduleOpen(delayMs) {
+    if (this.closed || this.reconnectTimer !== null) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.open().catch((error) => {
+        // 取 token / 取网关地址失败也在这一层 —— 同样要退避重试，
+        // 否则"启动时刚好断网"会让 QQ 永远连不上（原来就是这个问题）。
+        this.log(`连接失败：${error.message}`);
+        this.onDisconnected(`连接失败：${error.message}`);
+      });
+    }, delayMs);
+  }
+
+  /** 连上之后重置退避 —— 否则一个长连接会被历史失败次数影响。 */
+  resetBackoff() {
+    this.reconnectFailures = 0;
+  }
+
+  /** 指数退避：5s、10s、20s、30s、30s…（上限 30 秒）。 */
+  nextBackoffMs() {
+    this.reconnectFailures += 1;
+    const step = Math.min(this.reconnectFailures - 1, 4);
+    return Math.min(5_000 * (2 ** step), 30_000);
+  }
+
+  /**
+   * 统一的"连接已断"入口。
+   *
+   * ⚠ 所有断开路径都必须走这里（close 事件 / 心跳判死 / 连接失败），
+   *   否则又会出现"某条路径忘了改状态" —— 原来就是 close 里没改状态。
+   *
+   * ⚠ **必须幂等，而且防抖要在"第一件事"就生效**。
+   *   踩过的坑（2026-10-14，我自己引入的）：`close()` 会**同步**触发
+   *   `close` 事件 → 那个监听器又调回本函数。如果防抖判据是
+   *   `reconnectTimer !== null`，那一刻它**还是 null**（排期在函数后段），
+   *   于是两路都往下走：退避次数翻倍、状态被覆盖两次。
+   *   所以要一个**进门就置位**的 `disconnecting` 标志。
+   */
+  onDisconnected(reason) {
+    if (this.closed || this.disconnecting) {
+      if (this.disconnecting) this.log(`已在断线处理中，忽略重复通知（${reason}）`);
+      return;
+    }
+    this.disconnecting = true;
+    if (this.heartbeat !== null) { clearInterval(this.heartbeat); this.heartbeat = null; }
+    this.pendingHeartbeats = 0;
+    const wait = this.nextBackoffMs();
+    this.reportStatus('connecting', `连接断开（${reason}），${Math.round(wait / 1000)} 秒后重连…`);
+    this.log(`连接断开（${reason}），${Math.round(wait / 1000)} 秒后重连（第 ${this.reconnectFailures} 次）`);
+    // ⚠ close 放最后：它会同步触发 close 监听器，那时 disconnecting 已置位。
+    try { this.socket?.close(); } catch { /* ignore */ }
+    this.scheduleOpen(wait);
+  }
+
+  /** Identify 的握手体。properties 是**线上可见**的客户端自称，改名时要一起改。 */
+  identifyPayload() {
+    return {
+      op: 2,
+      d: {
+        token: `QQBot ${this.token}`,
+        intents: INTENTS,
+        shard: [0, 1],
+        properties: { $os: 'windows', $browser: 'dsh-im-bridge', $device: 'dsh-im-bridge' },
+      },
+    };
+  }
+
+  /** Resume 的握手体：带上会话 id 与已收到的 seq，网关据此补发遗漏事件。 */
+  resumePayload() {
+    return {
+      op: 6,
+      d: { token: `QQBot ${this.token}`, session_id: this.sessionId, seq: this.lastSeq ?? 0 },
+    };
+  }
+
+  async open() {
+    if (this.closed) return;
+    // 新一次的连接尝试开始了 —— 清掉"正在断线"的标志。
+    this.disconnecting = false;
+
+    // ⚠ 每次重连都重新取 token：`ensureToken()` 自己判过期（带 60 秒余量），
+    //   所以这里顺手就解决了"睡了一夜 token 已过期"的情况。
+    await this.ensureToken();
+
+    // Resume 要连回**原来那个网关地址**（官方：Resume 用于恢复登录态，
+    // 不是新开会话），所以有会话时优先复用它；失败再退回新开会话。
+    const canResume = this.sessionId !== null && this.resumeGatewayUrl !== null;
+    let url = this.resumeGatewayUrl ?? null;
+    if (url === null) {
+      const gateway = await this.apiGet('/gateway');
+      url = gateway.url;
+      // 记住它：下次重连要在**同一个网关**上 Resume，不是重新开一个会话。
+      this.resumeGatewayUrl = url;
+      this.log(`网关：${url}`);
+    }
+
+    const socket = new WebSocket(url);
+    this.socket = socket;
+
+    /** 本连接是否已拿到 READY/RESUMED（用于"Hello 之前就断了"的判断）。 */
+    let authenticated = false;
+
+    socket.addEventListener('open', () => this.log(`WebSocket 已连接（${canResume ? '尝试 Resume' : '新会话'}）`));
+
+    socket.addEventListener('message', (event) => {
+      let payload;
+      try { payload = JSON.parse(String(event.data)); } catch { return; }
+      if (payload.s !== undefined && payload.s !== null) this.lastSeq = payload.s;
+
+      switch (payload.op) {
+        case 10: {   // Hello → 起心跳，然后 Resume 或 Identify
+          const interval = payload.d?.heartbeat_interval ?? 45000;
+          this.heartbeatIntervalMs = interval;
+          if (this.heartbeat !== null) clearInterval(this.heartbeat);
+          this.pendingHeartbeats = 0;
+          this.heartbeat = setInterval(() => this.sendHeartbeat(socket), interval);
+
+          // ⚠ 这次发送要兜住异常：socket 可能已经不在 OPEN 状态了
+          //   （服务端发完 Hello 就断、或刚好在关闭中）。不兜的话，
+          //   异常会从这个 message 监听器里抛出去，**没有任何人接** ——
+          //   表现就是连接莫名其妙停住、日志里一片安静。
+          try {
+            socket.send(JSON.stringify(canResume ? this.resumePayload() : this.identifyPayload()));
+          } catch (error) {
+            this.log(`发 ${canResume ? 'Resume' : 'Identify'} 失败：${error.message}`);
+            this.onDisconnected('握手发送失败');
+          }
+          break;
+        }
+        case 11:     // ★ Heartbeat ACK —— 有了它才能证明连接是活的
+          this.pendingHeartbeats = Math.max(0, this.pendingHeartbeats - 1);
+          break;
+        case 0: {    // Dispatch
+          // READY / RESUMED 都代表"这条连接已鉴权成功"
+          if (payload.t === 'READY' || payload.t === 'RESUMED') {
+            authenticated = true;
+            this.resetBackoff();
+            this.resumeGatewayUrl = url;
+          }
+          if (payload.t === 'RESUMED') {
+            this.log('会话已恢复 —— 断线期间的遗漏事件由网关补发中');
+            this.reportStatus('connected', '连接已恢复');
+          }
+          this.onMessage(payload).catch((error) => this.log(`处理事件出错：${error.message}`));
+          break;
+        }
+        case 7:      // 服务端要求重连
+          this.log('服务端要求重连');
+          socket.close();
+          break;
+        case 9:      // 鉴权失败（Invalid Session）
+          // ⚠ 原来这里只把 token 置 null 就**什么都不做**了 —— 那条连接就此
+          //   永久卡死（既不发心跳也不重连）。现在：清掉会话状态（下次走
+          //   Identify 而非 Resume），强制刷新 token，然后主动断开重连。
+          this.log('鉴权失败（Invalid Session）——清会话、刷新 token 后重连');
+          this.sessionId = null;
+          this.lastSeq = null;
+          this.resumeGatewayUrl = null;
+          this.token = null;
+          socket.close();
+          break;
+        default:
+          break;
+      }
+    });
+
+    socket.addEventListener('close', () => {
+      // 已经是僵尸连接时（对端静默消失）这个事件根本不会来 ——
+      // 那种情况由心跳 ACK 判活兜住。
+      // `authenticated` 只用于日志里区分"刚连上就断"与"连过一阵才断"。
+      this.onDisconnected(authenticated ? '连接关闭' : '尚未鉴权即断开');
+    });
+
+    socket.addEventListener('error', (event) => this.log(`WebSocket 错误：${event?.message ?? '(无详情)'} —— 等 close 或心跳判活`));
+  }
+
+  /**
+   * 发一次心跳，并检查**上一批**心跳是否得到过 ACK。
+   *
+   * 判死条件：`pendingHeartbeats` 超过容忍值。含义是"连着发了 N 次心跳，
+   * 服务端一次 ACK 都没回" —— 这正是连接已死的特征（僵尸 socket）。
+   * 一旦判死就主动 close 走重连，而不是继续对着空气发心跳。
+   */
+  sendHeartbeat(socket) {
+    if (heartbeatAckExceeded(this.pendingHeartbeats)) {
+      this.log(`心跳连续 ${this.pendingHeartbeats} 次未收到 ACK —— 判定连接已死，主动断开`);
+      this.onDisconnected(`心跳无 ACK ×${this.pendingHeartbeats}`);
+      return;
+    }
+    if (socket.readyState !== WebSocket.OPEN) return;
+    try {
+      socket.send(JSON.stringify({ op: 1, d: this.lastSeq }));
+      // 只有**真的发出去了**才 +1。发送抛错说明连接已坏，交给 close/判活。
+      this.pendingHeartbeats += 1;
+    } catch (error) {
+      this.log(`心跳发送失败：${error.message}`);
+      this.onDisconnected('心跳发送失败');
+    }
   }
 
   dispose() {
     this.closed = true;
+    this.disconnecting = true;
     if (this.heartbeat !== null) clearInterval(this.heartbeat);
     if (this.refreshTimer !== null) clearInterval(this.refreshTimer);
+    if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
     try { this.socket?.close(); } catch { /* ignore */ }
   }
 }
@@ -1757,6 +1999,10 @@ export function apply(ctx, config = {}) {
       appSecret: credential.appSecret,
       sandbox: config.sandbox !== false,
       log,
+      // ★ 客户端一发现断线就**当场**把状态报到界面上。
+      //   原来这条线是断的：close 里只重连、不报状态，于是界面永远停在
+      //   「已连接」，而连接其实早就死了（2026-10-14 那次 7.6 小时的假在线）。
+      onStatus: (phase, message) => setRuntime('qq', phase, message),
     });
 
     qq.onMessage = async (payload) => {
@@ -1767,7 +2013,13 @@ export function apply(ctx, config = {}) {
       if (type === 'READY') {
         const bot = data.user?.username ?? '?';
         log(`已就绪：${bot}`);
-        recordStatus('ready', { bot: data.user?.username ?? null });
+        // ⚠ 记住 session_id 与 seq（op 6 Resume 要用）：
+        //   断线重连时带上它们，网关会**补发**断开期间遗漏的事件。
+        //   不记这两个值，"睡了一夜"那段时间别人发的消息就永久丢了。
+        if (typeof data.session_id === 'string' && data.session_id !== '') {
+          qq.sessionId = data.session_id;
+        }
+        recordStatus('ready', { bot: data.user?.username ?? null, seq: qq.lastSeq ?? null });
         writeStatusSnapshot({ phase: 'connected', bot: data.user?.username ?? null, sandbox: config.sandbox !== false });
         // ★ 这一行原来漏了 —— 设置页读的是 platformRuntime，不是上面那个快照。
         //   不写它，QQ 就会永远停在 "idle"（界面显示「未测试」），
@@ -3409,3 +3661,19 @@ export function apply(ctx, config = {}) {
     log('已停止');
   }, 'im-bridge: 关闭 QQ 长连接、状态接口、看门狗并清理状态');
 }
+
+/**
+ * 导出客户端类**只为可测性**（2026-10-14 加）。
+ *
+ * 这次修的"静默死亡"是个**行为**问题（连接早死了，代码却一路认为自己活着）。
+ * 文本断言对这种问题完全无力 —— 能看到 `case 11` 写没写，
+ * 看不出"连续 3 次心跳无 ACK 到底会不会断开重连"。所以需要一个校验器
+ * 能 `new QqClient(...)` + 假 WebSocket 真跑一遍。
+ *
+ * ⚠ 放在**文件末尾**是必需的：`export { X }` 会被提升，写在类声明之前
+ *   评估时会撞 TDZ（`Cannot access 'QqClient' before initialization`）。
+ *   这也是为什么不在类定义上方导出它。
+ *
+ * ⚠ 别把它当成对外 API —— 构造签名会随内部需要变。
+ */
+export { QqClient };

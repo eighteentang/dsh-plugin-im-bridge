@@ -129,7 +129,7 @@ AppSecret   —— 一串字母数字，**不要外传**
 3. 在「包名或地址」里填**这个插件的 GitHub 地址**：
 
 ```sh
-github:eighteentang/dsh-plugin-im-bridge#v1.2.6
+github:eighteentang/dsh-plugin-im-bridge#v1.2.7
 ```
 
 4. 确认安装，然后**重启 DSH 客户端**
@@ -152,7 +152,7 @@ github:eighteentang/dsh-plugin-im-bridge#v1.2.6
 DSH 自带插件管理命令：
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.6
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.7
 ```
 
 > **`--profile` 的名字**：填**你自己的** profile 名 —— 看 `~/.dsh/profiles/`
@@ -179,12 +179,12 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-br
 
 ### 关于版本
 
-上面两种方式都**推荐带 `#v1.2.6`** —— 不写标签装的是 `main` 的**最新提交**，
+上面两种方式都**推荐带 `#v1.2.7`** —— 不写标签装的是 `main` 的**最新提交**，
 上游随时可能变。
 
 ```sh
 # 装某个具体版本（把 v1.2.4 换成你要的）
-github:eighteentang/dsh-plugin-im-bridge#v1.2.6
+github:eighteentang/dsh-plugin-im-bridge#v1.2.7
 
 # 看有哪些版本可选
 #   https://github.com/eighteentang/dsh-plugin-im-bridge/tags
@@ -206,7 +206,7 @@ github:eighteentang/dsh-plugin-im-bridge#v1.2.6
 ### 升级
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.6   # 换成的版本号
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.7   # 换成的版本号
 ```
 
 然后**重启客户端**。
@@ -223,7 +223,7 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-br
 看 profile 里那份 `package.json` 的 `dsh-plugin-im-bridge` 字段：
 
 ```sh
-# 装了标签版 → 显示 github:eighteentang/dsh-plugin-im-bridge#v1.2.6
+# 装了标签版 → 显示 github:eighteentang/dsh-plugin-im-bridge#v1.2.7
 # 装了浮动版 → 显示 github:eighteentang/dsh-plugin-im-bridge
 cat ~/.dsh/profiles/<profile名>/package.json
 ```
