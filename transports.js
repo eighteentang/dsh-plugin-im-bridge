@@ -67,6 +67,12 @@ async function waitFor(predicate, timeoutMs, intervalMs = 250) {
 // ⚠ 只有"长连接"才需要可选组件；下面的 REST 握手测试不用，所以这条 import
 //   不会让插件在未安装组件时加载失败（loadComponentPackage 是**可失败的**）。
 import { loadComponentPackage } from './components.js';
+// 微信入站媒体（图片/文件/视频）的下载 + AES-128-ECB 解密。
+// 单独一个模块的理由写在它的文件头：media.js 是平台无关的，而微信的图
+// **不是下下来就能看**，得先解密 —— 那段逻辑跟 iLink 协议绑死。
+import { saveWeixinInboundMedia, weixinTextOf } from './weixin-media.js';
+// 媒体怎么拼进给 agent 的文字，全插件只有一份实现（在 media.js 里）。
+import { withMediaPaths } from './media.js';
 
 /** 带超时的 fetch —— 所有网络调用都必须有超时，否则界面会一直转圈。 */
 async function fetchWithTimeout(url, options = {}, timeoutMs = 10_000) {
@@ -428,8 +434,6 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
         for (const message of (Array.isArray(data?.msgs) ? data.msgs : [])) {
           // message_type 1 = 用户发来的；2 = 机器人自己发的（要跳过，否则自问自答）
           if (message?.message_type !== 1) continue;
-          const text = String(message?.item_list?.[0]?.text_item?.text ?? '').trim();
-          if (text === '') continue;
           // 记下"收到这条消息的时刻"，发出时算时延。
           //
           // ⚠ 为什么要算它（2026-10-08 排查用）：实测现象是"服务端受理了
@@ -437,11 +441,43 @@ export function startWeixinLoop({ token, onInbound, onEvent }) {
           //   **收到后 0.4 秒内立刻发**的那次。所以时延是个关键变量 ——
           //   iLink 的 `context_token` 有可能只在短时间内有效。
           //   把时延记下来，就能和"用户到底收没收到"对上号。
+          //
+          // ⚠ 必须放在**下载媒体之前**（2026-10-13 补）：这个字段量的是
+          //   "收到 → 发出"，而下载解密要花时间。放到下载之后就不再是同一个
+          //   含义了，历史数据也没法比。
           message.__receivedAt = Date.now();
-          onEvent?.('weixin-inbound', { chars: text.length });
+
+          // ── 文本和媒体都要取（2026-10-13 改）──────────────────────
+          // 原来这里是 `item_list[0].text_item.text`：纯图片消息取到空串，
+          // 再被下一行判空丢掉 —— **整条消息静默消失**。
+          // 用户发一张图，插件这边安静得像什么都没发生，日志里也只有一行
+          // 无关紧要的记录。现在改成遍历整个 item_list。
+          const text = weixinTextOf(message?.item_list);
+
+          // ⚠ 媒体这一步的失败**绝不能**冒到外层：外层那个 catch 会把它当作
+          //   "轮询失败"，于是整条通道进入退避重试 —— 一张图存不下（比如桌面
+          //   目录不可写）不该让用户从此收不到任何消息。
+          let media = [];
+          let mediaNote = '';
+          try {
+            media = await saveWeixinInboundMedia(message?.item_list, onEvent);
+          } catch (error) {
+            mediaNote = `[媒体处理失败] ${String(error?.message ?? error).slice(0, 120)}`;
+            onEvent?.('weixin-media-failed', { message: mediaNote });
+          }
+
+          // 纯图片那条：下载失败了也要让 agent 知道"收到过一张图，没取下来"，
+          // 否则用户那边看到的还是"什么都没发生"（就是这次要修的那个症状）。
+          const body = withMediaPaths(text, media);
+          const fullBody = mediaNote === '' ? body : `${body}${body === '' ? '' : '\n'}${mediaNote}`;
+          if (fullBody === '') continue;
+
+          onEvent?.('weixin-inbound', { chars: text.length, media: media.length });
           lastMessage = message;
+          // 媒体路径拼进文字里：本机没有别的通道能把一张图交给 agent，
+          // agent 拿到本地路径后可以自己用 read_image 读。
           // 把这条消息专属的回复闭包交上去
-          onInbound?.(text, (replyText) => sendTo(message, replyText));
+          onInbound?.(fullBody, (replyText) => sendTo(message, replyText));
         }
       } catch (error) {
         if (stopped) return;

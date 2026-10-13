@@ -50,6 +50,11 @@ DSH 是一个能读写文件、执行命令、跑长任务的编码 agent。
 | **随手查** | 让它读某个文件、列目录、搜代码，结果直接回到手机上 |
 | **长任务** | 发起一件事然后走开，回来在 DSH 里看完整过程 |
 | **双向对话** | 不只是"发指令" —— 它会回话、会追问、会报告进度 |
+| **发图 / 语音 / 文件** | 手机上发一张截图或文件 ✱，它会存在电脑桌面上并把路径交给 agent —— agent 能直接读那张图 |
+
+> ✱ **当前平台覆盖**：QQ 支持图文 / 语音 / 文件的**收发**；
+> 微信支持**收**（图片解密、语音取自带转写），出站待做。
+> 附件落在 `<你的桌面>/im-bridge-media/<平台>/<日期>/`，文件名会做清洗。
 
 **每个平台各有一条独立的专用会话**（QQ 和微信互不干扰），
 也和你电脑上正在进行的会话互不干扰。
@@ -124,7 +129,7 @@ AppSecret   —— 一串字母数字，**不要外传**
 3. 在「包名或地址」里填**这个插件的 GitHub 地址**：
 
 ```sh
-github:eighteentang/dsh-plugin-im-bridge#v1.2.5
+github:eighteentang/dsh-plugin-im-bridge#v1.2.6
 ```
 
 4. 确认安装，然后**重启 DSH 客户端**
@@ -147,7 +152,7 @@ github:eighteentang/dsh-plugin-im-bridge#v1.2.5
 DSH 自带插件管理命令：
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.5
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.6
 ```
 
 > **`--profile` 的名字**：填**你自己的** profile 名 —— 看 `~/.dsh/profiles/`
@@ -174,12 +179,12 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-br
 
 ### 关于版本
 
-上面两种方式都**推荐带 `#v1.2.5`** —— 不写标签装的是 `main` 的**最新提交**，
+上面两种方式都**推荐带 `#v1.2.6`** —— 不写标签装的是 `main` 的**最新提交**，
 上游随时可能变。
 
 ```sh
 # 装某个具体版本（把 v1.2.4 换成你要的）
-github:eighteentang/dsh-plugin-im-bridge#v1.2.5
+github:eighteentang/dsh-plugin-im-bridge#v1.2.6
 
 # 看有哪些版本可选
 #   https://github.com/eighteentang/dsh-plugin-im-bridge/tags
@@ -201,7 +206,7 @@ github:eighteentang/dsh-plugin-im-bridge#v1.2.5
 ### 升级
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.5   # 换成的版本号
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-bridge#v1.2.6   # 换成的版本号
 ```
 
 然后**重启客户端**。
@@ -218,7 +223,7 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-im-br
 看 profile 里那份 `package.json` 的 `dsh-plugin-im-bridge` 字段：
 
 ```sh
-# 装了标签版 → 显示 github:eighteentang/dsh-plugin-im-bridge#v1.2.5
+# 装了标签版 → 显示 github:eighteentang/dsh-plugin-im-bridge#v1.2.6
 # 装了浮动版 → 显示 github:eighteentang/dsh-plugin-im-bridge
 cat ~/.dsh/profiles/<profile名>/package.json
 ```
@@ -272,6 +277,44 @@ curl http://127.0.0.1:8799/im-bridge/status
 
 ---
 
+## 五·二、发图片 / 语音 / 文件
+
+**直接在聊天里发就行**，不用打任何命令。
+
+附件会落在**你的桌面**：
+
+```
+<桌面>/im-bridge-media/<平台>/<日期>/<文件名>
+例如  C:\Users\你\Desktop\im-bridge-media\weixin\2026-10-13\照片.jpg
+```
+
+插件把**本地路径拼进给 agent 的消息**里，所以你可以直接说：
+
+```
+看看我刚发的那张图，告诉我上面写的什么
+```
+
+agent 会自己去读那个文件（它有 `read_image` 等工具）。
+
+| 平台 | 收（你发给机器人） | 发（机器人回给你） |
+|---|---|---|
+| **QQ** | ✅ 图文 / 语音 / 文件 | ✅ 图文 / 语音 / 文件（单文件 ≤ 5 MB）|
+| **微信** | ✅ 图片（自动解密）/ 语音（取自带转写）| ⏳ 出站待做 |
+
+**几个已知边界（如实说）**：
+
+- **QQ 单文件上限 5 MB** —— 超过会**明确报错**，不会硬传一个被截断的文件。
+  分片上传还没做。
+- **微信语音不下载音频**，只取微信自带的转写文字（本机没有 ffmpeg，silk 转不了码）。
+- **文件名会被清洗**（剥掉路径分隔符与 Windows 非法字符）——
+  附件名是对方给的，不能直接信。
+- **图片解密失败不静默**：会在旁边留一份密文原件并记事件，方便事后查。
+
+> 想换落地目录？目前写死在桌面。改的话在 `media.js` 的 `mediaDirFor`。
+> （为什么不做成配置项：还没有"要换"的真实需求，多一个口子就多一处要维护。）
+
+---
+
 ## 六、模型配置（可能需要你改）
 
 插件让各平台的专用会话用**你 DSH 里设置的默认模型**。但有个坑：
@@ -299,6 +342,26 @@ DSH 内置的默认是 `deepseek-official`（**需要 `DEEPSEEK_API_KEY`**）。
 | `workspace` | 各平台专用会话的工作目录（默认 DSH 的工作目录） |
 | `sandbox` | 是否连 QQ 沙箱环境（默认 `true`；只管 QQ） |
 | `permissionPreset` | 专用会话的权限预设（默认 `danger-full-access`） |
+| `agentSessionId` | **覆盖 QQ 的专用会话 id**（默认留空 = 用内置值）|
+
+### 什么时候要改 `agentSessionId`
+
+模型会把**历史里关于自身能力的错误结论**继承下去 —— 那种情况下改代码没用，
+**得换一个全新会话**（换上下文）让修好的能力真正生效。
+
+⚠ **但绝不要改内置默认值那个思路**：默认值是**所有用户共享**的，改掉它等于让每个装这个
+插件的人一起换会话、丢历史。正确做法是在**自己的 profile patch** 里设：
+
+```yaml
+- id: im-bridge
+  config:
+    agentSessionId: "im-bridge-dedicated-v2"
+```
+
+**换 id 是非破坏性的**：旧会话数据仍完整留在 `~/.dsh/sessions/.../im-bridge-dedicated-v1/`，
+只是不再被 resume。想回去，把那一行删掉即可。代价是新会话读不到旧对话历史。
+
+> ⚠ **必须重启客户端才生效**（插件代码不热加载）。
 
 ---
 
