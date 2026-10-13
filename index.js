@@ -607,6 +607,17 @@ const ConfigSchema = {
           workspace: typeof input.workspace === 'string' ? input.workspace : '',
           // 绑定到固定会话；留空则按 QQ 用户派生
           sessionId: typeof input.sessionId === 'string' ? input.sessionId : '',
+          // 专用 agent 的会话 id 覆盖。**留空就用内置默认值**（见 dedicatedSessionId）。
+          //
+          // 为什么要有这个口子：默认 id 写死在代码里，而"换一个全新会话"是让
+          // 已修好的能力真正生效的手段 —— 模型会把历史里关于自身能力的错误结论
+          // 继承下去，改代码解决不了，得换上下文（这条经验的来龙去脉见
+          // DEDICATED_SESSION_ID 上方的注释）。
+          //
+          // ⚠ **但绝不能靠改那个默认值来顺手解决**：默认值是所有用户共享的，
+          //   改掉它等于让每个装这个插件的人一起换会话、丢历史。
+          //   所以留一个覆盖口子，需要的人在自己的 **profile patch** 里设。
+          agentSessionId: typeof input.agentSessionId === 'string' ? input.agentSessionId : '',
           // QQ 会话用哪个角色预设。留空默认 'standard'。
           // 注意：这里不能省 —— 不绑 preset 的 agent 不会执行。
           agentPreset: typeof input.agentPreset === 'string' ? input.agentPreset : '',
@@ -2207,6 +2218,27 @@ export function apply(ctx, config = {}) {
    * ⚠ 这条经验的通用形式：**"能力修好了"和"对方相信自己有能力"是两件事。**
    *   当一个 agent 在对话里形成了关于自身能力的错误结论，那个结论会被
    *   后续每一轮继承下去 —— 改代码解决不了，得换上下文。
+   *
+   * ⚠ **默认值不要改**（2026-10-12 加了一条覆盖口子，原因记在这里）。
+   *
+   *   这个默认值是**所有用户共享**的。改掉它 = 每个装这个插件的人下次启动都会
+   *   换一个全新会话 —— 也就是**丢历史**。所以"我需要换个会话"这种个人需求
+   *   绝不能靠改这一行解决。
+   *
+   *   正确做法：在**自己的 profile patch** 里设 `agentSessionId`，例如
+   *     - id: im-bridge
+   *       config:
+   *         agentSessionId: "im-bridge-dedicated-v2"
+   *   （2026-10-12 用户就是这么做的：他把个人事务的工作目录搬到 `D:\workspace`，
+   *     而**已存在的会话不会自动搬家** —— resume 路径不传 cwd，
+   *     分支① 还会优先复用内存里的 agent。所以只能换会话 id。
+   *     换 id 是非破坏性的：旧会话数据仍完整留在
+   *     `~/.dsh/sessions/--D-EasyDSH--/im-bridge-dedicated-v1/`，只是不再被 resume；
+   *     想回去，把 profile 里那行删掉即可。代价是新会话读不到旧对话历史 ——
+   *     用户已知情并接受，交接记录在 `D:\workspace\HANDOFF-2026-10-12.md`。）
+   *
+   *   ⚠ 注意这个覆盖**必须重启客户端才生效**（插件代码不热加载）。
+   *     在此之前一切照旧 —— 改动是惰性的，不会半途生效。
    */
   const DEDICATED_SESSION_ID = 'im-bridge-dedicated-v1';
 
@@ -2224,7 +2256,11 @@ export function apply(ctx, config = {}) {
    *   所以这里对 qq 做特例，其余平台用 `im-bridge-<平台>-v1`。
    */
   function dedicatedSessionId(platform) {
-    return platform === 'qq' ? DEDICATED_SESSION_ID : `im-bridge-${platform}-v1`;
+    // qq 允许用 config.agentSessionId 覆盖（默认仍是那个固定 id，见上方注释）。
+    // 其余平台暂不给覆盖口子 —— 没有"要换"的需求，多一个口子就多一处要维护。
+    return platform === 'qq'
+      ? firstNonEmpty([config.agentSessionId, DEDICATED_SESSION_ID])
+      : `im-bridge-${platform}-v1`;
   }
 
   /**
