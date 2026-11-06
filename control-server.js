@@ -20,7 +20,7 @@
  */
 
 import { createServer } from 'node:http';
-import { openSync, readSync, fstatSync, closeSync } from 'node:fs';
+import { openSync, readSync, fstatSync, closeSync, appendFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -199,23 +199,53 @@ function normalizePlatform(raw) {
 }
 
 /**
- * 允许跨域访问的来源 —— **只给本机回环页面**。
+ * 允许跨域访问的来源 —— 只给**本机回环页面**与**DSH 桌面端自己**。
  *
- * ⚠ 2026-11-07 修：原来这里是把请求里的 `Origin` **原样反射**回去
- *   （`res.setHeader('access-control-allow-origin', origin)`）。
+ * ⚠ 2026-11-07 修：原来这里是把请求里的 `Origin` **原样反射**回去。
  *   那等于**任何网站**都能读写这个本机接口：
- *     · POST /im-bridge/send → 往 agent 里塞一句话，agent 有本机工具权限
- *       （本项目默认 danger-full-access），等于"访问一个网页就可能被远程执行"；
+ *     · POST /im-bridge/send → 往 agent 里塞一句话，agent 有本机工具权限；
  *     · GET  /im-bridge/messages → 把私聊内容读走；
  *     · POST /im-bridge/platform、/credential、/components → 改开关、写凭据、装组件。
- *   服务器只监听回环 + 面板只在同机浏览器里跑，所以**没有任何理由**放行域名来源。
- *   DNS rebinding 也会被这条挡住（浏览器报的 Origin 仍是攻击者域名）。
+ *   服务器只监听回环，所以域名来源一律不放行；DNS rebinding 也会被挡住。
  *
- * 放行的形式：`http(s)://127.0.0.1[:port]`、`http(s)://localhost[:port]`、
- * `http(s)://[::1][:port]`。注意 DSH Web UI 与本接口**端口不同**，属于跨域，
- * 所以还是要回 `Access-Control-Allow-Origin`；但只回声给上面这几种。
+ * ⚠ v1.2.8 刚发出去就踩到的坑（v1.2.9 修）：**DSH 桌面端的页面 Origin 是
+ *   `dsh-app://app`，不是 `http://127.0.0.1:...`**（Electron 用
+ *   `--standard-schemes=dsh-app` 把它注册成标准 scheme）。第一版白名单只写了
+ *   http 回环，结果桌面端所有面板/设置页的 fetch 全部 403 ——
+ *   表现就是"侧边栏的微信绿泡泡突然不见了"（动态注册拉 /platforms 失败）。
+ *   所以桌面端这个 origin 必须一起放行；它只有 DSH 桌面应用能产生，安全边界不变。
+ *
+ * 放行的形式：
+ *   · `http(s)://127.0.0.1[:port]` / `http(s)://localhost[:port]` / `http(s)://[::1][:port]`
+ *     （浏览器直接打开 Web GUI 的情况）
+ *   · `dsh-app://app[/]`（DSH 桌面应用的页面）
  */
-const LOOPBACK_ORIGIN = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i;
+const ALLOWED_ORIGIN_PATTERNS = [
+  /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i,
+  /^dsh-app:\/\/app\/?$/i,
+];
+
+export function isAllowedOrigin(origin) {
+  return ALLOWED_ORIGIN_PATTERNS.some((pattern) => pattern.test(origin));
+}
+
+/**
+ * 被拒来源只记**第一次**（最多 20 个）—— 给"面板突然消失"这类排查看。
+ * 不这样记的话，桌面端每 5 秒一次轮询会把日志刷爆。
+ */
+const seenRejectedOrigins = new Set();
+
+function recordRejectedOrigin(origin) {
+  if (seenRejectedOrigins.size >= 20 || seenRejectedOrigins.has(origin)) return;
+  seenRejectedOrigins.add(origin);
+  try {
+    appendFileSync(STATUS_FILE, `${JSON.stringify({
+      time: new Date().toISOString(),
+      event: 'cors-rejected-origin',
+      origin: origin.slice(0, 120),
+    })}\n`, 'utf8');
+  } catch { /* 日志失败不影响拒绝本身 */ }
+}
 
 /**
  * @param {object} options
@@ -232,7 +262,8 @@ export function startStatusServer({ log, getMessages, sendToAgent, listModels, s
     //   只在响应里"不给 CORS 头"是不够的：浏览器会拦下读响应，
     //   但 POST 的副作用**已经发生了**（CSRF）。所以要直接 403 拒掉。
     //   没有 Origin 的请求（本机 curl / 脚本 / 同机工具）保持可用。
-    if (origin !== '' && !LOOPBACK_ORIGIN.test(origin)) {
+    if (origin !== '' && !isAllowedOrigin(origin)) {
+      recordRejectedOrigin(origin);
       log(`状态接口拒绝外部来源：origin=${origin}`);
       res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('forbidden (origin)');

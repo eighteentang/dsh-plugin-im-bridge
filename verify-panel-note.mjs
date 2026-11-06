@@ -130,7 +130,17 @@ const run = (lines) => {
 };
 writeFileSync(join(tmp, 'control-server-verify.mjs'), readFileSync(join(HERE, 'control-server.js'), 'utf8'), 'utf8');
 process.env.DSH_HOME = tmp;
-const { readStatusSnapshot } = await import(pathToFileURL(join(tmp, 'control-server-verify.mjs')).href);
+const { readStatusSnapshot, isAllowedOrigin } = await import(pathToFileURL(join(tmp, 'control-server-verify.mjs')).href);
+
+// 来源白名单的**真函数**测试 —— 桌面端 origin 漏掉过一次（v1.2.8 的线上事故）
+if (typeof isAllowedOrigin === 'function') {
+  for (const ok of ['dsh-app://app', 'dsh-app://app/', 'http://127.0.0.1:63077', 'http://localhost:1234', 'https://[::1]:9000']) {
+    check(`放行来源 ${ok}`, isAllowedOrigin(ok) === true);
+  }
+  for (const bad of ['https://evil.example', 'http://evil.example', 'dsh-app://other', 'null', 'file://', '']) {
+    check(`拒绝来源 ${bad === '' ? '(空)' : bad}`, isAllowedOrigin(bad) === false);
+  }
+}
 
 // 场景 A：旧日志（replied 没有 platform，紧跟一条同字节数的 weixin-replied）
 const snapA = run([
@@ -170,12 +180,13 @@ check('重试成功的回复也算一次回复',
   snapE.counts.replied === 1 && snapE.lastReply?.platform === 'weixin', JSON.stringify(snapE.lastReply));
 
 console.log('\n=== 8. 控制接口只放行本机来源（防任意网页驱动 agent）===');
-check('有回环来源白名单', /const LOOPBACK_ORIGIN = \/\^https\?:/.test(serverCode));
+check('有来源白名单，且包含 DSH 桌面端 origin',
+  /const ALLOWED_ORIGIN_PATTERNS/.test(serverCode) && /dsh-app:/.test(serverCode));
 check('非白名单来源直接 403（不是只缺 CORS 头）',
-  /!LOOPBACK_ORIGIN\.test\(origin\)/.test(serverCode) && /forbidden \(origin\)/.test(serverCode));
+  /!isAllowedOrigin\(origin\)/.test(serverCode) && /forbidden \(origin\)/.test(serverCode));
 check('来源检查在 OPTIONS 之前（preflight 也拦）',
-  serverCode.indexOf('!LOOPBACK_ORIGIN.test(origin)') !== -1
-  && serverCode.indexOf('!LOOPBACK_ORIGIN.test(origin)') < serverCode.indexOf("req.method === 'OPTIONS'"));
+  serverCode.indexOf('!isAllowedOrigin(origin)') !== -1
+  && serverCode.indexOf('!isAllowedOrigin(origin)') < serverCode.indexOf("req.method === 'OPTIONS'"));
 
 rmSync(tmp, { recursive: true, force: true });
 
