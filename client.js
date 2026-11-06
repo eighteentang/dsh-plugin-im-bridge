@@ -41,6 +41,15 @@ window.__ModuleLoader__.load({
     //   现在有 verify-two-sided-paths.mjs 专门比对这件事。
     const CONTROL_BASE = 'http://127.0.0.1:8799/im-bridge';
 
+    /** 体积显示（设置页的媒体清理用；和宿主 media.js 的 formatBytes 同一套写法） */
+    const fmtBytes = (bytes) => {
+      const n = Number(bytes ?? 0);
+      if (!Number.isFinite(n) || n <= 0) return '0 B';
+      if (n < 1024) return `${n} B`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+      return `${(n / 1024 / 1024).toFixed(2)} MB`;
+    };
+
     const CSS = `
 .qqb-wrap{display:flex;flex-direction:column;gap:14px;padding:4px 0;font-size:13px;color:var(--dsw-alias-label-primary)}
 .qqb-row{display:flex;flex-direction:column;gap:6px}
@@ -349,17 +358,33 @@ window.__ModuleLoader__.load({
      *
      * 设计原则：**显示结论，不显示事件流。**
      * 用户要的是"能用了没有"，不是"第 06:34:07.716 行发生了什么"。
+     *
+     * ⚠ 2026-11-07 改成**按平台**：原来这一段只有 QQ —— 连提示都是
+     *   "未连接 QQ —— 请填写下方 AppID 与 AppSecret"。可它挂在「连接 IM」
+     *   这个多平台页面的最上方，只用微信/飞书的用户一打开，最醒目的一行
+     *   就是在说他没在用（甚至已经关掉）的 QQ。
+     *   现在：
+     *   · 只列**开着的**平台，每个平台一行（名字 + 已连接/未连接/出错）；
+     *   · 最近收到/回复来自宿主日志摘要，会标出是哪个平台；
+     *   · 错误列表本来就是全平台的，保持原样。
      */
     function StatusPanel() {
       ensureStyle();
+      // platforms：/platforms 的原文（每个平台的开关 + 运行时 phase）
+      // snapshot ：/status 的摘要（最近活动 / 错误 / 计数）
+      const [platforms, setPlatforms] = React.useState(null);
       const [snapshot, setSnapshot] = React.useState(null);
       const [unreachable, setUnreachable] = React.useState(false);
 
       const refresh = React.useCallback(async () => {
         try {
-          const response = await fetch(`${CONTROL_BASE}/status`, { method: 'GET' });
-          if (!response.ok) throw new Error(`HTTP ${response.status}`);
-          setSnapshot(await response.json());
+          const [p, s] = await Promise.all([
+            fetch(`${CONTROL_BASE}/platforms`, { method: 'GET' }),
+            fetch(`${CONTROL_BASE}/status`, { method: 'GET' }),
+          ]);
+          if (!p.ok || !s.ok) throw new Error(`HTTP ${p.status}/${s.status}`);
+          setPlatforms(await p.json());
+          setSnapshot(await s.json());
           setUnreachable(false);
         } catch {
           // 拉不到状态本身也是有用信息：说明宿主侧插件没在跑
@@ -377,7 +402,7 @@ window.__ModuleLoader__.load({
         return h('div', { className: 'qqb-status err' },
           '宿主侧插件没有响应 —— 插件可能未启用，或需要重启客户端一次。');
       }
-      if (snapshot === null) {
+      if (platforms === null || snapshot === null) {
         return h('div', { className: 'qqb-status' }, '正在读取状态…');
       }
 
@@ -388,30 +413,46 @@ window.__ModuleLoader__.load({
         return d.toLocaleTimeString('zh-CN', { hour12: false });
       };
 
+      /** 平台 id → 用户认识的面板名（"微信绿泡泡" / "奇怪的企鹅" …） */
+      const titleOf = (id) => PLATFORMS.find((p) => p.id === id)?.title ?? String(id ?? '');
+      const enabled = PLATFORMS.filter((meta) => platforms?.platforms?.[meta.id] === true);
+
       const rows = [];
 
-      // ① 连接状态 —— 用户最关心的一件事，放最上面
-      rows.push(h('div', { className: 'qqb-stat-row', key: 'conn' },
-        h('span', { className: `qqb-dot ${snapshot.connected ? 'on' : 'off'}` }),
-        h('span', null, snapshot.connected
-          ? `已连接 QQ${snapshot.bot === null ? '' : `（机器人：${snapshot.bot}）`}`
-          : '未连接 QQ —— 请填写下方 AppID 与 AppSecret')));
+      // ① 每个**开着的**平台一行 —— 用户最关心"我用的那个连上没有"。
+      //    关掉的平台不在这里列（它不是错误；下面「平台」那一节会写"已关闭"）。
+      for (const meta of enabled) {
+        const runtime = platforms?.status?.[meta.id] ?? null;
+        const phase = String(runtime?.phase ?? 'idle');
+        const linked = phase === 'connected' || phase === 'verified';
+        rows.push(h('div', { className: 'qqb-stat-row', key: `platform-${meta.id}` },
+          h('span', { className: `qqb-dot ${linked ? 'on' : 'off'}` }),
+          h('span', { className: 'qqb-stat-label' }, meta.title),
+          h('span', {
+            className: 'qqb-stat-value' + (phase === 'error' ? ' bad' : ''),
+            title: String(runtime?.message ?? ''),
+          }, PHASE_TEXT[phase] ?? phase)));
+      }
 
-      // ② 最近一条收到的消息
-      if (snapshot.lastInbound !== null) {
+      // ② 最近一条收到的消息（宿主摘要现在会标平台）
+      if (snapshot.lastInbound !== null && snapshot.lastInbound !== undefined) {
+        const text = String(snapshot.lastInbound.text ?? '');
         rows.push(h('div', { className: 'qqb-stat-row', key: 'in' },
           h('span', { className: 'qqb-stat-label' }, '最近收到'),
           h('span', { className: 'qqb-stat-value' },
-            `${fmtTime(snapshot.lastInbound.time)}　${snapshot.lastInbound.text}`)));
+            `${fmtTime(snapshot.lastInbound.time)}　${titleOf(snapshot.lastInbound.platform)} · ${text === '' ? '（无文字，可能是图片/文件）' : text}`)));
       }
 
-      // ③ 最近一次回复 + 是否成功 —— "能不能用"的直接判据
-      if (snapshot.lastReply !== null) {
+      // ③ 最近一次回复 + 是否成功 —— "能不能用"的直接判据。
+      //    ⚠ lastTurn 来自**任意平台**的 agent 轮次结束（不是 QQ 专属）。
+      //    两者都取"最近一次"，正常情况下配对；多平台交错时只是近似 ——
+      //    比不显示强，但别把它当成严格的因果配对。
+      if (snapshot.lastReply !== null && snapshot.lastReply !== undefined) {
         const turnOk = snapshot.lastTurn?.ok;
         rows.push(h('div', { className: 'qqb-stat-row', key: 'out' },
           h('span', { className: 'qqb-stat-label' }, '最近回复'),
           h('span', { className: `qqb-stat-value ${turnOk === false ? 'bad' : ''}` },
-            `${fmtTime(snapshot.lastReply.time)}　${snapshot.lastReply.bytes} 字`,
+            `${fmtTime(snapshot.lastReply.time)}　${titleOf(snapshot.lastReply.platform)} · ${snapshot.lastReply.bytes} 字`,
             turnOk === false ? '（这一轮失败了，见下方错误）' : '')));
       }
 
@@ -423,7 +464,7 @@ window.__ModuleLoader__.load({
             `${fmtTime(e.time)}　${e.event}${e.detail === null ? '' : `：${e.detail}`}`))));
       }
 
-      // ⑤ 累计计数：一眼看出"到底通过没有"
+      // ⑤ 累计计数：一眼看出"到底通过没有"（现在是全平台的合计）
       rows.push(h('div', { className: 'qqb-stat-counts', key: 'counts' },
         `累计：收到 ${snapshot.counts.inbound} 条 · 回复 ${snapshot.counts.replied} 条`,
         snapshot.counts.errors > 0 ? ` · 错误 ${snapshot.counts.errors} 次` : ''));
@@ -934,6 +975,73 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 设置页：媒体文件（只提供"清理旧文件"的入口，不做自动清理）。
+     *
+     * 为什么值得有：收进来的图片 / 语音 / 文件都落在
+     * `<桌面>/im-bridge-media/<平台>/<日期>/`，只增不减；用户偶尔会想清。
+     * 删除是**显式两步**（点「清理」→ 再点「确认」）—— 删的是用户桌面上的
+     * 文件，误删的代价比省一点空间大，所以不做自动清理。
+     */
+    function MediaSection() {
+      ensureStyle();
+      const [armed, setArmed] = React.useState(false);
+      const [busy, setBusy] = React.useState(false);
+      const [result, setResult] = React.useState('');
+      const [isError, setIsError] = React.useState(false);
+
+      const clean = async () => {
+        setBusy(true);
+        setResult('');
+        setIsError(false);
+        try {
+          const response = await fetch(`${CONTROL_BASE}/media/clean`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ days: 30 }),
+          });
+          const json = await response.json();
+          if (json?.ok === false) {
+            setIsError(true);
+            setResult(String(json.error ?? '清理失败'));
+          } else {
+            setResult(`已清理 ${json.files ?? 0} 个文件，释放 ${fmtBytes(json.bytes ?? 0)}`);
+          }
+        } catch {
+          setIsError(true);
+          setResult('连不上插件（Host 侧没在跑？）');
+        } finally {
+          setBusy(false);
+          setArmed(false);
+        }
+      };
+
+      return h('div', { className: 'qqb-row' },
+        h('label', null, '媒体文件'),
+        h('div', { className: 'qqb-hint' },
+          '收到的图片 / 语音 / 文件存在「桌面 / im-bridge-media / <平台> / <日期> /」。'),
+        h('div', { className: 'qqb-actions' },
+          armed
+            ? [
+                h('button', {
+                  key: 'yes', className: 'qqb-btn', type: 'button', disabled: busy,
+                  onClick: () => { void clean(); },
+                }, busy ? '清理中…' : '确认清理 30 天前的文件'),
+                h('button', {
+                  key: 'no', className: 'qqb-btn qqb-btn-ghost', type: 'button', disabled: busy,
+                  onClick: () => { setArmed(false); setResult(''); },
+                }, '取消'),
+              ]
+            : h('button', {
+                className: 'qqb-btn qqb-btn-ghost', type: 'button',
+                onClick: () => { setArmed(true); setResult(''); setIsError(false); },
+              }, '清理 30 天前的媒体文件')),
+        result === '' ? null : h('div', {
+          className: 'qqb-hint',
+          style: isError ? { color: 'var(--dsw-alias-state-error-primary)' } : undefined,
+        }, result));
+    }
+
+    /**
      * 设置页：连接 IM
      *
      * ⚠ 2026-10-08 大改：这个组件**不再自己管 QQ 凭据**了。
@@ -964,7 +1072,9 @@ window.__ModuleLoader__.load({
         //    这边 `QQ_BOT_APPID/SECRET` 走宿主凭据存储）——
         //    用户看到同一个 QQ 被拆到页面两处，这就是"乱"的来源。
         h(PlatformToggles, null),
-        // ③ 可选组件 —— 重 SDK 的安装 / 卸载（体积写在按钮旁，装了能回收空间）
+        // ③ 媒体文件 —— 只提供"清理旧文件"入口（用户显式两步确认）
+        h(MediaSection, null),
+        // ④ 可选组件 —— 重 SDK 的安装 / 卸载（体积写在按钮旁，装了能回收空间）
         h(ComponentSection, null),
         // ④ 脚注：**只放对所有平台都成立的话**。
         //
@@ -1135,7 +1245,10 @@ window.__ModuleLoader__.load({
         // ⚠ 面板文案块（2026-10-08 加）：面板已抽成**共用实现**，
         //   每个平台的空状态/提示语由这里给，不再写死在面板里。
         ui: {
-          offlineHint: '去「设置 → 连接 QQ」看看',
+          // ⚠ 菜单名必须是「连接 IM」：设置页 2026-09-26 就从「连接 QQ」改成
+          //   多平台入口了（见 registerSettings 处的说明）。这里跟着微信那行一起改，
+          //   否则 QQ 用户会去菜单里找一个不存在的「连接 QQ」。
+          offlineHint: '去「设置 → 连接 IM」里点 QQ 的「测试连接」',
           emptyTitle: '这里是企鹅的窝',
           emptyDesc: '在手机 QQ 上给它发消息，它会在这台电脑上干活；也可以直接在下面输入 —— 两条路走的是同一个大脑。',
           placeholder: '让它干点什么…',
@@ -1454,7 +1567,7 @@ window.__ModuleLoader__.load({
       const platformId = m.id ?? 'qq';
       const platformTitle = m.title ?? '奇怪的企鹅';
       const ui = m.ui ?? {
-        offlineHint: '去「设置 → 连接 QQ」看看',
+        offlineHint: '去「设置 → 连接 IM」里点 QQ 的「测试连接」',
         emptyTitle: '这里是企鹅的窝',
         emptyDesc: '在手机 QQ 上给它发消息，它会在这台电脑上干活；'
           + '也可以直接在下面输入 —— 两条路走的是同一个大脑。',
@@ -1470,8 +1583,13 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState('');
       const bodyRef = React.useRef(null);
       const stickBottom = React.useRef(true);
+      // 同一时刻只允许一个 /messages 在飞：宿主那边要按会话派生消息，
+      // 网络/磁盘慢的时候 2 秒一次的轮询会叠起来，越叠越慢（而且响应会乱序）。
+      const loadingRef = React.useRef(false);
 
       const load = React.useCallback(async () => {
+        if (loadingRef.current) return;
+        loadingRef.current = true;
         try {
           const response = await fetch(
             CONTROL_BASE + '/messages?limit=80&platform=' + encodeURIComponent(platformId),
@@ -1482,13 +1600,24 @@ window.__ModuleLoader__.load({
           setError(json?.ok === false ? String(json.error ?? '读取失败') : '');
         } catch (err) {
           setError('连不上插件（Host 侧没在跑？）');
+        } finally {
+          loadingRef.current = false;
         }
       }, [platformId]);
 
       React.useEffect(() => {
         void load();
-        const timer = setInterval(() => { void load(); }, 2000);
-        return () => clearInterval(timer);
+        const timer = setInterval(() => {
+          // 页面在后台时不轮询 —— 没人看，白耗本机 IO
+          if (document.hidden !== true) void load();
+        }, 2000);
+        // 切回前台立刻补一次，不用等下一个 2 秒
+        const onVisible = () => { if (document.hidden !== true) void load(); };
+        document.addEventListener('visibilitychange', onVisible);
+        return () => {
+          clearInterval(timer);
+          document.removeEventListener('visibilitychange', onVisible);
+        };
       }, [load]);
 
       /**
@@ -1505,7 +1634,10 @@ window.__ModuleLoader__.load({
        */
       React.useEffect(() => {
         let alive = true;
+        let probing = false;      // 6 秒一次的探活也不许叠
         const probe = async () => {
+          if (probing || document.hidden === true) return;
+          probing = true;
           try {
             const response = await fetch(
               CONTROL_BASE + '/status?platform=' + encodeURIComponent(platformId),
@@ -1516,6 +1648,8 @@ window.__ModuleLoader__.load({
           } catch (err) {
             // 连插件都问不到 = 肯定不在线
             if (alive) { setLinkUp(false); publishLink(platformId, false); }
+          } finally {
+            probing = false;
           }
         };
         void probe();

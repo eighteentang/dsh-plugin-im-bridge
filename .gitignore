@@ -8,6 +8,10 @@ _tmp-*
 # 日志
 *.log
 
+# 运行时数据（DSH 会话记忆库 —— 纯本机私有数据，绝不进包）
+.dsh-memory/
+.dsh-meow/
+
 # 编辑器 / 系统
 .vscode/
 .idea/

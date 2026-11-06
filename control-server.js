@@ -45,10 +45,16 @@ const STATUS_FILE = join(STATUS_DIR, 'im-bridge-status.log');
  * 把状态日志**摘要**成界面能直接显示的结构。
  *
  * 设计原则：界面要的是"结论"，不是"事件流"。所以只回答用户真正会问的：
- *   · QQ 连上了吗？（connected / bot）
- *   · 最近收到什么消息？（lastInbound）
- *   · 最近回了什么、成功了吗？（lastReply / lastTurn.ok）
+ *   · 某个平台连上了吗？（`/status?platform=` 的 connected / phase；
+ *     快照里的 `connected` / `bot` 仍然只代表 QQ，保留给旧调用）
+ *   · 最近收到什么消息？（lastInbound，带 `platform`）
+ *   · 最近回了什么、成功了吗？（lastReply / lastTurn.ok，lastTurn 只对 QQ 有意义）
  *   · 出过错吗？（recentErrors，已过滤掉"预期内"的噪声）
+ *
+ * ⚠ 2026-11-07：lastInbound / lastReply 加了 `platform`，并补上微信的
+ *   `weixin-inbound-text` / `weixin-replied`。原来只认 QQ 的事件名，
+ *   于是只用微信的用户在状态面板里永远看到「收到 0 条 · 回复 0 条」——
+ *   那不是事实，是摘要器没看他用的通道。
  *
  * 只读日志尾部 64KB：日志会持续增长，取最近一段足够覆盖近期活动。
  */
@@ -65,6 +71,9 @@ export function readStatusSnapshot() {
     logPath: STATUS_FILE,
   };
 
+  // 最近一条 weixin-replied（只给"识别旧日志"用，不单独计数）—— 见下面的 replied 分支
+  let lastWeixinReply = null;
+
   try {
     const fd = openSync(STATUS_FILE, 'r');
     const size = fstatSync(fd).size;
@@ -73,8 +82,12 @@ export function readStatusSnapshot() {
     readSync(fd, buffer, 0, windowBytes, size - windowBytes);
     closeSync(fd);
 
-    // 首行可能被截断，丢掉
-    for (const line of buffer.toString('utf8').split('\n').slice(1)) {
+    // ⚠ 只有**窗口从文件中间开始**时，首行才是被截断的残行。
+    //   原来无条件 `slice(1)`，于是日志还不到 64KB（刚装上、刚启动）时，
+    //   第一行是**完整事件**却被丢掉 —— 如果那行正好是 `ready`，
+    //   界面就会把已连上的 QQ 显示成"未连接"（已修，2026-11-07）。
+    const truncated = size > windowBytes;
+    for (const line of buffer.toString('utf8').split('\n').slice(truncated ? 1 : 0)) {
       const trimmed = line.trim();
       if (trimmed === '') continue;
       let entry;
@@ -91,13 +104,51 @@ export function readStatusSnapshot() {
           break;
         case 'c2c-message':
           snapshot.counts.inbound += 1;
-          snapshot.lastInbound = { time: entry.time, text: entry.text ?? '' };
+          snapshot.lastInbound = { time: entry.time, text: entry.text ?? '', platform: 'qq' };
           break;
-        case 'replied':
+        // ⚠ 微信的入站事件（2026-11-07 补）。名称和 QQ 不一样：
+        //   入站文本是 index.js 的 `weixin-inbound-text`（每条交给 agent 的消息一条）。
+        //   只认它、不认 `weixin-inbound` —— 后者是同一个消息在传输层的另一条事件，
+        //   两个都算会**重复计数**。
+        case 'weixin-inbound-text':
+          snapshot.counts.inbound += 1;
+          snapshot.lastInbound = { time: entry.time, text: entry.text ?? '', platform: 'weixin' };
+          break;
+        // 出站统一走 `replied`：index.js 的 sendReply 成功回调对**所有平台**都记它。
+        // 微信额外还有一条传输层的 `weixin-replied` —— 那条**只用来识别旧日志**
+        // （见下面的 legacyWeixin），不再单独计数，否则一次回复会被算成两条。
+        case 'weixin-replied':
+          lastWeixinReply = { time: entry.time, bytes: entry.bytes ?? 0 };
+          break;
+        case 'replied': {
+          // ⚠ 旧日志的 `replied` 没有 platform 字段（2026-11-07 前），当时微信回复
+          //   也走这条 → 会被错标成 QQ。判据：紧跟着一条**同字节数**的
+          //   `weixin-replied`（同一次回复路径上，两个事件前后脚写入）。
+          const legacyWeixin = entry.platform === undefined
+            && lastWeixinReply !== null
+            && lastWeixinReply.bytes === (entry.bytes ?? 0)
+            && Math.abs(Date.parse(entry.time) - Date.parse(lastWeixinReply.time)) < 5000;
           snapshot.counts.replied += 1;
-          snapshot.lastReply = { time: entry.time, bytes: entry.bytes ?? 0 };
+          snapshot.lastReply = {
+            time: entry.time,
+            bytes: entry.bytes ?? 0,
+            platform: entry.platform ?? (legacyWeixin ? 'weixin' : 'qq'),
+          };
+          break;
+        }
+        case 'reply-retry-ok':
+          // 第一次发送失败、后台重试成功 —— 这也是一次**成功的回复**，
+          // 而且它不会走上面的 `replied`（重试闭包只发消息，不重复跑回调）。
+          // 不认这条的话，状态面板会永远显示"最近回复"是更早的一次。
+          snapshot.counts.replied += 1;
+          snapshot.lastReply = {
+            time: entry.time,
+            bytes: entry.bytes ?? 0,
+            platform: entry.platform ?? 'qq',
+          };
           break;
         case 'turn-end-seen':
+          // 这条事件来自**任意平台**的 agent 轮次结束（不是 QQ 专属）。
           snapshot.lastTurn = { time: entry.time, reason: entry.reason ?? null };
           break;
         default:
@@ -148,15 +199,45 @@ function normalizePlatform(raw) {
 }
 
 /**
+ * 允许跨域访问的来源 —— **只给本机回环页面**。
+ *
+ * ⚠ 2026-11-07 修：原来这里是把请求里的 `Origin` **原样反射**回去
+ *   （`res.setHeader('access-control-allow-origin', origin)`）。
+ *   那等于**任何网站**都能读写这个本机接口：
+ *     · POST /im-bridge/send → 往 agent 里塞一句话，agent 有本机工具权限
+ *       （本项目默认 danger-full-access），等于"访问一个网页就可能被远程执行"；
+ *     · GET  /im-bridge/messages → 把私聊内容读走；
+ *     · POST /im-bridge/platform、/credential、/components → 改开关、写凭据、装组件。
+ *   服务器只监听回环 + 面板只在同机浏览器里跑，所以**没有任何理由**放行域名来源。
+ *   DNS rebinding 也会被这条挡住（浏览器报的 Origin 仍是攻击者域名）。
+ *
+ * 放行的形式：`http(s)://127.0.0.1[:port]`、`http(s)://localhost[:port]`、
+ * `http(s)://[::1][:port]`。注意 DSH Web UI 与本接口**端口不同**，属于跨域，
+ * 所以还是要回 `Access-Control-Allow-Origin`；但只回声给上面这几种。
+ */
+const LOOPBACK_ORIGIN = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i;
+
+/**
  * @param {object} options
  * @param {(msg: string) => void} options.log
  * @returns {{ dispose: () => void, port: number }}
  */
-export function startStatusServer({ log, getMessages, sendToAgent, listModels, setModel, getCredential, getPlatforms, setPlatform, testPlatform, pollWeixinLogin, savePlatformCredential, getComponents, installComponent, removeComponent, getRuntime }) {
+export function startStatusServer({ log, getMessages, sendToAgent, listModels, setModel, getCredential, getPlatforms, setPlatform, testPlatform, pollWeixinLogin, savePlatformCredential, getComponents, installComponent, removeComponent, getRuntime, cleanMedia }) {
   const server = createServer((req, res) => {
     const remote = req.socket.remoteAddress ?? '';
     const origin = String(req.headers.origin ?? '');
     const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+
+    // ⚠ 来源检查必须**先于 OPTIONS**，也必须先于任何业务处理 ——
+    //   只在响应里"不给 CORS 头"是不够的：浏览器会拦下读响应，
+    //   但 POST 的副作用**已经发生了**（CSRF）。所以要直接 403 拒掉。
+    //   没有 Origin 的请求（本机 curl / 脚本 / 同机工具）保持可用。
+    if (origin !== '' && !LOOPBACK_ORIGIN.test(origin)) {
+      log(`状态接口拒绝外部来源：origin=${origin}`);
+      res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('forbidden (origin)');
+      return;
+    }
 
     if (origin !== '') {
       res.setHeader('access-control-allow-origin', origin);
@@ -474,6 +555,31 @@ export function startStatusServer({ log, getMessages, sendToAgent, listModels, s
           } catch (error) {
             res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: false, message: String(error?.message ?? error) }));
+          }
+        });
+      })();
+      return;
+    }
+
+    // ── 设置页：清理媒体目录里超过 N 天的文件 ──
+    //
+    // ⚠ 会**删文件**。范围严格限制在 `<桌面>/im-bridge-media/`（见 media.js），
+    //   而且只接受 POST —— 避免链接预取/GET 误触发。
+    //   这是用户显式点「确认清理」才走的路径，不做任何自动清理。
+    if (url.pathname === '/im-bridge/media/clean' && req.method === 'POST') {
+      void (async () => {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; if (body.length > 4 * 1024) req.destroy(); });
+        req.on('end', async () => {
+          try {
+            const parsed = JSON.parse(body === '' ? '{}' : body);
+            const days = Number(parsed.days);
+            const result = await cleanMedia?.(Number.isFinite(days) && days > 0 ? days : 30);
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(result ?? { ok: false, error: '没有 cleanMedia 处理函数' }));
+          } catch (error) {
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: String(error?.message ?? error) }));
           }
         });
       })();

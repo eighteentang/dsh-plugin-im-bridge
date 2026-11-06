@@ -25,7 +25,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync, mkdirSync, existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join, basename, extname } from 'node:path';
 import { homedir } from 'node:os';
 import { startStatusServer } from './control-server.js';
@@ -51,6 +51,7 @@ import {
 } from './components.js';
 import {
   MAX_INLINE_UPLOAD_BYTES,
+  cleanOldMedia,
   formatBytes,
   mediaDirFor,
   qqFileTypeOf,
@@ -83,9 +84,57 @@ const STATUS_JSON = join(STATUS_DIR, 'im-bridge-status.json');
 //     条目变化时自动重排图标列表
 // 客户端读不到文件，所以这份状态必须落在宿主，再通过控制接口给界面。
 //
-// ⚠ QQ 通道**不允许关闭**：这个会话本身就跑在它上面，关掉等于把通信掐断。
-//   setPlatformEnabled 会明确拒绝，而不是静默忽略。
+// ⚠ **QQ 也能关**（2026-10-08 起）：它用自己的专用会话（im-bridge-dedicated-v1），
+//   和微信（im-bridge-weixin-v1）互相独立，关掉 QQ 不会掐断别的平台。
+//   唯一的守卫是**通用的**：不能关掉最后一个开着的平台 ——
+//   全关掉侧边栏就一个入口都没有了，用户回不来（见 setPlatformEnabled）。
+//   ⚠ 原来这里写的是"QQ 不允许关闭"；那句话已过期，且 loadPlatforms 里
+//     还留着一行 `merged.qq = true` 把用户的关闭结果在重启后改回来 —— 已删。
 const PLATFORM_IDS = ['qq', 'weixin', 'feishu', 'dingtalk', 'wecom'];
+
+/**
+ * 平台 → 这个平台在**手机上**叫什么（面板空状态用）。
+ *
+ * ⚠ 不能拿客户端 `PLATFORMS[].title` 顶替：那是**面板的品牌名**
+ *   （"奇怪的企鹅" / "微信绿泡泡"），塞进"在手机 ___ 上给它发一条"读不通。
+ *   这里要的是"用户会怎么称呼这个聊天 App"。
+ *
+ * ⚠ 新增平台时，这里和 client.js 的 PLATFORMS 都要加。漏了不会崩 ——
+ *   chatAppName() 回落到 "IM"，句子变成"在手机 IM 上…"，只是不好读。
+ */
+const PLATFORM_CHAT_APP = {
+  qq: 'QQ',
+  weixin: '微信',
+  feishu: '飞书',
+  dingtalk: '钉钉',
+  wecom: '企业微信',
+};
+
+/**
+ * 面板空状态里"在手机 ___ 上给它发一条试试"的那个 ___。
+ *
+ * 导出是为了让校验脚本能直接测（和上面的 heartbeatAckExceeded 同一个理由：
+ * 这类纯函数只有真跑过才知道对，靠读代码不算验证）。
+ */
+export function chatAppName(platform) {
+  return PLATFORM_CHAT_APP[String(platform ?? '').trim().toLowerCase()] ?? 'IM';
+}
+
+/**
+ * 面板空状态那句提示 —— 渠道名必须跟着平台走。
+ *
+ * 单独抽出来有两个原因：
+ *   · 它是**用户能看到的原文**，校验脚本要能直接断言（不用启动整个插件）；
+ *   · 原来这句话写死在 readPanelMessages 里、渠道写死成 QQ，
+ *     点开微信面板也让人"在手机 QQ 上发一条"（用户报的错）。
+ */
+export function panelEmptyNote(platform) {
+  const app = chatAppName(platform);
+  // 中文与拉丁字母之间留空格（"在手机 QQ 上"）—— 和空状态描述里
+  // "在手机 QQ 上给它发消息"的排版一致；中文平台名不留（"在手机微信上"）。
+  const phrase = /[A-Za-z]/.test(app) ? ` ${app} ` : app;
+  return `还没有任何对话 —— 在手机${phrase}上给它发一条试试`;
+}
 
 /**
  * 各平台凭据在 credentials 服务里的键。
@@ -176,7 +225,10 @@ function loadPlatforms() {
     for (const id of PLATFORM_IDS) {
       if (typeof parsed[id] === 'boolean') merged[id] = parsed[id];
     }
-    merged.qq = true;   // 永不关闭（见上面的说明）
+    // ⚠ 这里原来有一行 `merged.qq = true;   // 永不关闭` ——
+    //   它让"用户在设置页关掉 QQ"只在本次运行有效，插件一重载就自己开回来。
+    //   QQ 早已允许关闭（见 setPlatformEnabled 的通用守卫），这行是漏删的旧逻辑。
+    //   删除后：关掉 QQ 会写进文件，重启/重载后仍然是关的。
     return merged;
   } catch (error) {
     if (error?.code !== 'ENOENT') {
@@ -277,10 +329,50 @@ function scheduleReplyRetry(send, context) {
   replyRetryTimers.add(timer);
 }
 
+/**
+ * 状态日志轮转（2026-11-07 加）。
+ *
+ * 为什么需要：`appendFileSync` 只增不减，而读的人只看最后 64KB。
+ * 长期运行（尤其 QQ 断线重连、媒体、错误事件多）这个文件会一直变大。
+ *
+ * 策略：超过 2MB 时只保留尾部 256KB，并在开头补一条 `status-log-rotated`。
+ * 保留量远大于读取窗口（64KB），所以轮转不会让界面丢近期事件。
+ *
+ * ⚠ 用 `writeFileSync` 直接重写（不是 tmp+rename）：Windows 上 rename 到已存在
+ * 的路径会失败。重写期间如果有并发读，读到的可能是空/半截文件 —— 读取端对
+ * "解析不了的行"是跳过的，代价只是那一次快照少几条事件；比"日志无限涨"划算。
+ */
+const STATUS_LOG_MAX_BYTES = 2 * 1024 * 1024;
+const STATUS_LOG_KEEP_BYTES = 256 * 1024;
+
+function rotateStatusLogIfNeeded() {
+  let size = 0;
+  try { size = statSync(STATUS_LOG).size; } catch { return; }
+  if (size <= STATUS_LOG_MAX_BYTES) return;
+  try {
+    const keep = Math.min(size, STATUS_LOG_KEEP_BYTES);
+    const fd = openSync(STATUS_LOG, 'r');
+    const buffer = Buffer.alloc(keep);
+    try { readSync(fd, buffer, 0, keep, size - keep); } finally { closeSync(fd); }
+    let text = buffer.toString('utf8');
+    // 窗口从文件中间开始 → 首行可能是半条 JSON，丢掉
+    const cut = text.indexOf('\n');
+    text = cut >= 0 ? text.slice(cut + 1) : '';
+    writeFileSync(STATUS_LOG, text, 'utf8');
+    appendFileSync(STATUS_LOG, `${JSON.stringify({
+      time: new Date().toISOString(),
+      event: 'status-log-rotated',
+      bytesBefore: size,
+      bytesAfter: Buffer.byteLength(text),
+    })}\n`, 'utf8');
+  } catch { /* 轮转失败就继续追加 —— 宁可文件大，也不能丢事件 */ }
+}
+
 function recordStatus(event, detail = {}) {
   const entry = { time: new Date().toISOString(), event, ...detail };
   try {
     mkdirSync(STATUS_DIR, { recursive: true });
+    rotateStatusLogIfNeeded();
     appendFileSync(STATUS_LOG, `${JSON.stringify(entry)}\n`, 'utf8');
   } catch { /* 状态记录失败不能影响主流程 */ }
   return entry;
@@ -1715,6 +1807,17 @@ export function apply(ctx, config = {}) {
   // 每个会话一条队列：会话忙时排队，空闲时投递
   const queues = new Map();   // sessionId → [{ text, openid, msgId }]
   /**
+   * 单会话队列上限（2026-11-07 加）。
+   *
+   * 为什么要上限：agent 卡住（模型报错、轮次不结束）时，用户/对方可以一直发，
+   * 队列只增不减 → 内存和"待办"无限增长。50 条已经远超正常使用
+   * （串行对话下，50 条意味着前面卡了很久），到顶就**丢新消息并告知**，
+   * 而不是无限堆着、让用户以为会回。
+   */
+  const MAX_QUEUED_PER_SESSION = 50;
+  /** 已经就"队列满"提示过的会话 —— 避免对方每发一条就收到一条提示 */
+  const overflowNotified = new Set();
+  /**
    * 正在等回答的会话：sessionId → 置忙的时刻（ms）。
    *
    * ⚠ 为什么是 Map 而不是 Set（这里踩过一个致命 bug）：
@@ -2266,6 +2369,23 @@ export function apply(ctx, config = {}) {
    * 也就是说两条 QQ 消息先后到达时，会合并成一个回合、只产生一个回答 ——
    * 那样两条消息只能收到一个回复。串行化可以保证"一条消息一个回答"。
    */
+  /**
+   * 队列满了 —— 尽量给对方回一句，别让新消息无声消失。
+   *
+   * 只做**尽力而为**：微信走消息级 reply 闭包，QQ 走 openid；
+   * 面板输入没有回发通道（错误会通过接口返回给界面）。
+   */
+  function notifyQueueOverflow(openid, opts) {
+    const notice = '（这边消息积压太多：先处理前面的，刚发的这条没排上，请稍后再发一次）';
+    try {
+      if (typeof opts.reply === 'function') {
+        void Promise.resolve(opts.reply(notice)).catch(() => {});
+      } else if ((opts.platform ?? 'qq') === 'qq' && openid !== '' && qq !== null) {
+        void Promise.resolve(qq.reply(openid, notice)).catch(() => {});
+      }
+    } catch { /* 提示发不出去不影响"丢消息"这个决定本身 */ }
+  }
+
   function enqueueDelivery(sessionId, text, openid, msgId, opts = {}) {
     const list = queues.get(sessionId) ?? [];
     // `opts` 承载"这条消息从哪来、怎么回"——多平台引入的（2026-10-08）。
@@ -2274,12 +2394,27 @@ export function apply(ctx, config = {}) {
     //                 ⚠ 微信的回复必须带上那条消息的 context_token，
     //                 所以它是消息级能力，不能用一个全局 send 代替。
     //                 为 undefined 时退回旧的"按平台查表"路径。
+    if (list.length >= MAX_QUEUED_PER_SESSION) {
+      recordStatus('queue-overflow', {
+        sessionId,
+        platform: opts.platform ?? 'qq',
+        pending: list.length,
+        dropped: true,
+      });
+      // 每个"积压期"只提示一次（队列降下来后会在 pumpQueue 里重置标记）
+      if (!overflowNotified.has(sessionId)) {
+        overflowNotified.add(sessionId);
+        notifyQueueOverflow(openid, opts);
+      }
+      return false;
+    }
     list.push({ text, openid, msgId, platform: opts.platform ?? 'qq', reply: opts.reply });
     queues.set(sessionId, list);
     recordStatus('queued', { sessionId, platform: opts.platform ?? 'qq', pending: list.length });
     pumpQueue(sessionId).catch((error) => {
       recordStatus('pump-failed', { sessionId, message: String(error?.message ?? error) });
     });
+    return true;
   }
 
   /**
@@ -2383,6 +2518,8 @@ export function apply(ctx, config = {}) {
     if (list === undefined || list.length === 0) return;
 
     const job = list.shift();
+    // 队列降下来了 → 下次再堆满时可以重新提示一次（见 notifyQueueOverflow）
+    if (list.length < MAX_QUEUED_PER_SESSION) overflowNotified.delete(sessionId);
     // 先用队列键登记；`deliverToAgent` 解析出 agent 后会补上会话键
     //（见它里面的 markBusy 调用）—— 这样两侧的检查都能看到"忙"。
     markBusy(sessionId);
@@ -2832,8 +2969,13 @@ export function apply(ctx, config = {}) {
    *   磁盘：原始事件流 → 要自己从 `type` + `data` 里抽文本，注意
    *        `assistant/message` 的 message 是**嵌套**在 data.message 里的，
    *        而 `user/message` 的字段直接在 data 上。
+   *
+   * `platform` 只影响**空状态提示语**里的渠道名（"在手机 QQ / 微信 / …上发一条"）。
+   *   这个函数返回的是**那个平台**的会话；提示语必须说那个平台的 App ——
+   *   原来写死"手机 QQ"，于是点开微信面板也让人去 QQ 上发消息（用户报的错）。
+   *   平台名查 PLATFORM_CHAT_APP，见 chatAppName()。
    */
-  async function readPanelMessages(sessionId, limit) {
+  async function readPanelMessages(sessionId, limit, platform = 'qq') {
     const sessions = ctx.get?.('sessions');
     const live = sessions?.get?.(sessionId);
 
@@ -2866,17 +3008,44 @@ export function apply(ctx, config = {}) {
         ok: true,
         source: 'none',
         messages: [],
-        note: missing ? '还没有任何对话 —— 在手机 QQ 上给它发一条试试' : message.slice(0, 160),
+        note: missing
+          ? panelEmptyNote(platform)
+          : message.slice(0, 160),
       };
     }
   }
 
+  /**
+   * 这条 role:user 的消息是不是"人真的说的话"。
+   *
+   * ⚠ 2026-11-07 修：DSH 会把**运行时上下文 / 技能清单 / AGENTS 指令 / 工作目录**
+   *   这些内容作为 `role: 'user'` 的消息注入会话（`source.kind` 各不相同：
+   *   `runtime-context` / `agent-instructions` / `tool-registry` …）。
+   *   面板原来只过滤 `role === 'system' || 'developer'`，于是**微信/QQ 面板会把
+   *   整段系统注入当成人话显示出来**（实测：一条「测试」后面跟着几千字的上下文）。
+   *
+   *   判据用 `source.kind`（DSH 自己的区分方式）：
+   *     · `kind === 'user'` —— 真人输入（包括本插件投递的手机消息，见构造处）
+   *     · `source` 缺失 —— 旧数据，照旧放行
+   *     · 其它 kind —— 都是系统注入，不显示
+   */
+  function isHumanUserMessage(message) {
+    const kind = message?.source?.kind;
+    return kind === undefined || kind === 'user';
+  }
+
   /** 从活会话的派生消息里抽出可显示的（role + 文本）—— 见 getPanelMessages 的说明 */
   function messagesFromDerived(derived, limit) {
+    // ⚠ 从**末尾往前**取，凑够 N 条就停：原来是把整段会话逐条抽文本再 slice 尾部，
+    //   长会话（几百上千条）下每 2 秒轮询都白算一遍。顺序在下面 reverse 回来。
+    const n = panelLimit(limit);
     const rows = [];
-    for (const message of derived ?? []) {
+    const list = Array.isArray(derived) ? derived : [];
+    for (let i = list.length - 1; i >= 0 && rows.length < n; i -= 1) {
+      const message = list[i];
       const role = String(message?.role ?? '?');
       if (role === 'system' || role === 'developer') continue;   // 提示词不进面板
+      if (role === 'user' && !isHumanUserMessage(message)) continue;   // 系统注入不进面板
       const content = Array.isArray(message?.content) ? message.content : [];
       const text = content
         .map((part) => (part?.type === 'text' ? String(part.text ?? '') : ''))
@@ -2885,7 +3054,8 @@ export function apply(ctx, config = {}) {
       if (text === '') continue;
       rows.push({ role, text: text.slice(0, 4000) });
     }
-    return tailOf(rows, limit);
+    rows.reverse();
+    return rows;
   }
 
   /**
@@ -2899,8 +3069,12 @@ export function apply(ctx, config = {}) {
    * 只取 text 块；reasoning 块是思考过程，不进面板（要看得把 showReasoning 打开）。
    */
   function messagesFromEvents(events, limit) {
+    // 同 messagesFromDerived：从末尾往前取，够 N 条就停（长事件流不再全量扫描）
+    const n = panelLimit(limit);
     const rows = [];
-    for (const event of events ?? []) {
+    const list = Array.isArray(events) ? events : [];
+    for (let i = list.length - 1; i >= 0 && rows.length < n; i -= 1) {
+      const event = list[i];
       const type = event?.type;
       const data = event?.data ?? {};
       let message = null;
@@ -2916,6 +3090,9 @@ export function apply(ctx, config = {}) {
         continue;
       }
 
+      // 系统注入（runtime-context / agent-instructions …）也是 role:'user'，别当成人话
+      if (role === 'user' && !isHumanUserMessage(message)) continue;
+
       const content = Array.isArray(message?.content) ? message.content : [];
       const text = content
         .map((part) => (part?.type === 'text' ? String(part.text ?? '') : ''))
@@ -2924,13 +3101,13 @@ export function apply(ctx, config = {}) {
       if (text === '') continue;
       rows.push({ role, text: text.slice(0, 4000), seq: event?.seq ?? null });
     }
-    return tailOf(rows, limit);
+    rows.reverse();
+    return rows;
   }
 
-  /** 取末尾 N 条（N 上下都有界，防止面板被超大 limit 拖垮） */
-  function tailOf(rows, limit) {
-    const n = Math.max(1, Math.min(400, Number.isFinite(limit) ? limit : 80));
-    return rows.slice(-n);
+  /** 面板一次最多取多少条（上下都有界，防止面板被超大 limit 拖垮） */
+  function panelLimit(limit) {
+    return Math.max(1, Math.min(400, Number.isFinite(limit) ? limit : 80));
   }
 
   /**
@@ -2948,7 +3125,8 @@ export function apply(ctx, config = {}) {
     //   用户报的"聊天框里没有消息记录"就是这个。
     //   备注：客户端 fila 时也从不带平台参数，两边都要改（见 control-server）。
     const sessionId = dedicatedSessionId(platform);
-    const read = await readPanelMessages(sessionId, limit);
+    // ⚠ 平台名要一起传：空状态提示语要说**这个平台**的 App（原来写死 QQ）
+    const read = await readPanelMessages(sessionId, limit, platform);
     return {
       ok: read.ok !== false,
       platform,
@@ -3148,7 +3326,11 @@ export function apply(ctx, config = {}) {
     const sessionId = `${platform}-panel:${dedicatedSessionId(platform)}`;
     // 面板消息：openid 传空（不回发到平台）—— 但**平台名要带上**，
     // 否则 finishTurn 无法区分"这是面板输入"还是"某个平台的入站消息"。
-    enqueueDelivery(sessionId, clean, '', undefined, { platform });
+    const queued = enqueueDelivery(sessionId, clean, '', undefined, { platform });
+    if (queued === false) {
+      // 面板输入没有回发到平台的通道，所以用接口错误直接告诉用户
+      return { ok: false, error: `这个会话积压了太多消息（上限 ${MAX_QUEUED_PER_SESSION} 条），等它处理完再发`, platform };
+    }
     return { ok: true, queued: true, platform };
   }
 
@@ -3320,7 +3502,9 @@ export function apply(ctx, config = {}) {
     sendReply()
       .then(() => {
         log(`已回复（${reply.length} 字符）`);
-        recordStatus('replied', { bytes: reply.length });
+        // ⚠ 必须带 platform：状态面板要按平台显示"最近回复"。
+        //   原来这条事件不带平台，摘要器只能当 QQ 处理 —— 微信回复会被标成 QQ。
+        recordStatus('replied', { bytes: reply.length, platform: slot.platform ?? 'qq' });
         writeStatusSnapshot({ phase: 'connected', lastReplyBytes: reply.length });
       })
       .catch((error) => {
@@ -3536,6 +3720,8 @@ export function apply(ctx, config = {}) {
       getComponents: getComponentsInfo,
       installComponent: installComponentById,
       removeComponent: removeComponentById,
+      // 设置页用：清理媒体目录里超过 N 天的文件（用户显式确认才调）
+      cleanMedia: cleanOldMedia,
     });
   } catch (error) {
     recordStatus('status-server-start-failed', { message: String(error?.message ?? error) });
@@ -3562,7 +3748,7 @@ export function apply(ctx, config = {}) {
       dispose = tools.register({
         name: 'im_send_media',
         description: [
-          '把一个本地文件发到用户的手机上（走 im-bridge 当前可用的 IM 渠道）。',
+          '把一个本地文件发到用户的手机上（**目前只支持 QQ 渠道**；微信的出站媒体还没做）。',
           '',
           '支持图片（png/jpg/gif/webp/bmp）、视频（mp4）、语音（silk）和任意文件。',
           `单个文件**不能超过 5MB** —— 这一版只实现了官方的小文件直传通道，`,
@@ -3649,6 +3835,7 @@ export function apply(ctx, config = {}) {
     pending.clear();
     bindings.clear();
     queues.clear();
+    overflowNotified.clear();
     // 入站去重表 + 回复重试定时器也要清 —— 否则插件重载后会留着旧定时器，
     // 它们拿着**上一代**的 qq 引用去发消息（那个连接已经 dispose 了）。
     seenInbound.clear();

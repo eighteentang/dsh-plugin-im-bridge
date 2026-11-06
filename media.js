@@ -15,7 +15,7 @@
  *   上传有三条路：URL 上传（要求文件已在公网可访问）、分片上传（大文件）、
  *   二进制直传（≤5MB）。本地小文件走第三条，见 `MAX_INLINE_UPLOAD_BYTES`。
  */
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readdirSync, statSync, rmSync } from 'node:fs';
 import { join, extname, basename } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -57,6 +57,55 @@ export function mediaDirFor(platform, when = new Date()) {
   const dir = join(desktopDir(), 'im-bridge-media', platform, `${y}-${m}-${d}`);
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** 媒体根目录（设置页的「清理」只在这个目录里动作） */
+export function mediaRootDir() {
+  return join(desktopDir(), 'im-bridge-media');
+}
+
+/**
+ * 清理媒体目录里超过 N 天的文件（**用户手动触发**，不自动跑）。
+ *
+ * 为什么是手动：这是**删用户桌面上的文件**，自动删的风险远大于收益
+ * （用户可能把 agent 处理过的图留着用）。所以只提供"显式点一下"的入口，
+ * 而且范围严格限制在 `<桌面>/im-bridge-media/` 里。
+ *
+ * 只删文件、不删目录（空目录留着无妨）；单个文件删失败不中断整体。
+ * 目录结构是 `<根>/<平台>/<日期>/<文件>`，最多走两层。
+ *
+ * @returns {{ok:boolean, root:string, days:number, scanned:number, files:number, bytes:number}}
+ */
+export function cleanOldMedia({ days = 30, now = Date.now() } = {}) {
+  const ageDays = Number.isFinite(Number(days)) && Number(days) > 0 ? Number(days) : 30;
+  const cutoff = now - ageDays * 24 * 60 * 60 * 1000;
+  const root = mediaRootDir();
+  const result = { ok: true, root, days: ageDays, scanned: 0, files: 0, bytes: 0 };
+
+  const walk = (dir, depth) => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (depth < 2) walk(full, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      let st;
+      try { st = statSync(full); } catch { continue; }
+      result.scanned += 1;
+      if (st.mtimeMs >= cutoff) continue;
+      try {
+        rmSync(full, { force: true });
+        result.files += 1;
+        result.bytes += st.size;
+      } catch { /* 单个失败不中断 */ }
+    }
+  };
+
+  walk(root, 0);
+  return result;
 }
 
 /**
